@@ -1,0 +1,7 @@
+MODULE Halt;
+IMPORT SYSTEM;
+VAR dummy: INTEGER;
+BEGIN
+  dummy := SYSTEM.SYS(0,0)
+END Halt.
+

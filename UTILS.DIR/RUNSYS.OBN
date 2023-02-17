@@ -1,0 +1,24 @@
+MODULE RunSys;
+IMPORT SYSTEM, Files, Loader, ComLine, Out;
+
+VAR SystemImage*: ARRAY 32000 OF BYTE;
+    sysname     : ARRAY 20 OF CHAR;
+    f           : Files.File;
+    rider       : Files.Rider;
+    size        : INTEGER;
+BEGIN
+  IF ComLine.arg1 = "" THEN Out.String("Usage: runsys system_image")
+  ELSE
+    f := Files.Old(ComLine.arg1);
+    IF f = NIL THEN Out.String(sysname); Out.String(" not found")
+    ELSE
+      Files.Set      (rider, f, LONG(0));
+      Files.ReadBytes(rider, SystemImage, LEN(SystemImage));
+      Files.Close(f);
+      IF rider.res = 0 THEN Out.String("System image too big") END;
+      IF NOT Loader.Call("BootSys") THEN Out.String("Cannot find BootSys module") END;
+      (* Loading BootSys with Loader.Call will make BootSys located higher than the memory image *)
+    END
+  END;
+  Out.Ln
+END RunSys.

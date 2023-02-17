@@ -1,0 +1,31 @@
+MODULE Install;
+(* Install a system in the reserved sectors of the disk *)
+IMPORT SYSTEM, Disk, Files, ComLine, Out;
+(* $O- don't check integer overflow in address calculations *)
+VAR image   : ARRAY 56*512 OF BYTE;
+    buffer  : Disk.Sector;
+    file    : Files.File;
+    rider   : Files.Rider;
+    sector,
+    size    : INTEGER;
+BEGIN
+  IF ComLine.arg1 = "" THEN Out.String("Usage: install system_image")
+  ELSE
+    file := Files.Old(ComLine.arg1);
+    IF file = NIL THEN Out.String("Cannot find "); Out.String(ComLine.arg1)
+    ELSE
+      Files.Set      (rider, file, LONG(0));
+      Files.ReadBytes(rider, image, LEN(image));
+      IF rider.res = 0 THEN Out.String("Image too big") END;
+      Files.Close    (file);
+
+      (* and write the reserved sectors *)
+      FOR sector:=1 TO 55 DO  (* skip first sector of image *)
+        SYSTEM.COPY(SYSTEM.ADR(image)+sector*512, SYSTEM.ADR(buffer), 512);
+        Disk.WriteSector(LONG(sector+8), buffer)
+      END
+    END
+  END;
+  Out.Ln
+END Install.
+

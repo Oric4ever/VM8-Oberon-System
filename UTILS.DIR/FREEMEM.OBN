@@ -1,0 +1,12 @@
+MODULE FreeMem;
+IMPORT SYSTEM, Out;
+VAR free: INTEGER;
+BEGIN
+  free := SYSTEM.FREEMEM();
+  IF free < 0
+  THEN Out.Long(LONG(free)+LONG(1,0), 5)
+  ELSE Out.Int (free, 5)
+  END;
+  Out.String(" bytes free.");
+  Out.Ln;
+END FreeMem.

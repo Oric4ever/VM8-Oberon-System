@@ -1,0 +1,36 @@
+MODULE Version;
+IMPORT Files, ComLine, FileName, Out;
+VAR modName: ComLine.FileName;
+    symbols: Files.File;
+    rider  : Files.Rider;
+    dummy, version: INTEGER;
+
+PROCEDURE WriteHex(x: INTEGER);
+  PROCEDURE HexDigit(x: INTEGER);
+  BEGIN
+    IF x > 9 THEN INC(x, 7) END;
+    Out.Char(CHR(x + ORD('0')))
+  END HexDigit;
+BEGIN
+  HexDigit(x DIV 1000H MOD 16);
+  HexDigit(x DIV 0100H MOD 16);
+  HexDigit(x DIV 0010H MOD 16);
+  HexDigit(x           MOD 16)
+END WriteHex;
+
+BEGIN
+  modName := ComLine.arg1;
+  IF modName = "" THEN Out.String("Usage: version module")
+  ELSE
+    FileName.BuildStdFileName(modName, ".SMB", TRUE);
+    symbols := Files.Old(modName);
+    IF symbols = NIL THEN Out.String("Cannot open "); Out.String(modName)
+    ELSE
+      Files.Set    (rider, symbols, LONG(0));
+      Files.ReadInt(rider, dummy);
+      Files.ReadInt(rider, version);
+      WriteHex(version)
+    END
+  END;
+  Out.Ln
+END Version.

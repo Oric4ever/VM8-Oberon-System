@@ -1,0 +1,164 @@
+MODULE HexEdit;
+IMPORT SYSTEM, Terminal, Files, ComLine;
+
+CONST ESC = 1BX;
+
+VAR mem : ARRAY 63*512 OF BYTE;
+    bufSize: INTEGER;
+    sectStart, offset: INTEGER;
+    fileSize, bufPos: LONGINT;
+    file : Files.File;
+    rider: Files.Rider;
+    dirty, exit: BOOLEAN;
+    char, char2: CHAR;
+
+PROCEDURE ReadFile;
+BEGIN
+  fileSize:= Files.Length(file);
+  bufPos  := LONG(0);
+  Files.Set(rider, file, bufPos);
+  Files.ReadBytes(rider, mem, LEN(mem));
+  bufSize := LEN(mem) - rider.res;
+END ReadFile;
+
+PROCEDURE CloseFile;
+BEGIN
+  IF dirty THEN
+    Files.Set(rider, file, bufPos);
+    Files.WriteBytes(rider, mem, bufSize);
+  END;
+  Files.Close(file)
+END CloseFile;
+
+PROCEDURE HexByte(val: INTEGER);
+  PROCEDURE HexDigit(val: INTEGER);
+  BEGIN
+    IF val < 10
+    THEN Terminal.Char(CHR(val    + ORD('0')))
+    ELSE Terminal.Char(CHR(val-10 + ORD('A')))
+    END
+  END HexDigit;
+BEGIN
+  HexDigit(val DIV 16); HexDigit(val MOD 16)
+END HexByte;
+
+PROCEDURE HexWord(val: INTEGER);
+BEGIN
+  HexByte(val DIV 256 MOD 256);
+  HexByte(val MOD 256)
+END HexWord;
+
+PROCEDURE ViewChar(byte: BYTE);
+BEGIN
+  IF (byte < 20H) OR (byte >= 7FH) THEN byte := ORD('.') END;
+  Terminal.Char(CHR(byte))
+END ViewChar;
+
+PROCEDURE View(startOffset: INTEGER);
+VAR row, col,i : INTEGER;
+    rowOffset  : INTEGER;
+    char       : CHAR;
+BEGIN
+  Terminal.ClearScreen;
+  FOR row := 0 TO 31 DO
+    Terminal.GotoXY(0, row);
+    rowOffset := startOffset + row * 16;
+    HexWord(rowOffset);
+    FOR i:=0 TO 15 DO
+      IF i MOD 4 = 0 THEN Terminal.Char(' ') END;
+      Terminal.Char(' '); HexByte(mem[rowOffset+i]);
+    END;
+    Terminal.Char(' '); Terminal.Char(' ');
+    FOR i:=0 TO 15 DO ViewChar(mem[rowOffset+i]) END;
+  END
+END View;
+
+PROCEDURE hexVal(char: CHAR): INTEGER;
+BEGIN
+  IF char > '9' THEN char := CHR(ORD(char) - 7) END;
+  RETURN ORD(char) - ORD('0')
+END hexVal;
+
+PROCEDURE SetXY(offset: INTEGER);
+VAR x,y : INTEGER;
+BEGIN
+  x := 6 + (offset MOD 16) * 3 + (offset MOD 16) DIV 4;
+  y := offset DIV 16;
+  Terminal.GotoXY(x,y);
+END SetXY;
+
+PROCEDURE ChangeSector(previous: BOOLEAN);
+BEGIN
+  char := Terminal.Get();
+  IF char = '~' THEN
+    IF NOT previous THEN
+      IF sectStart + 512 < bufSize THEN INC(sectStart,512) END
+    ELSE
+      IF sectStart > 511 THEN DEC(sectStart,512) END
+    END;
+    View(sectStart)
+  END
+END ChangeSector;
+
+PROCEDURE ReadCommand;
+BEGIN
+  char := Terminal.Get();
+  IF char = '[' THEN
+    char := Terminal.Get();
+    CASE char OF
+    | 'A' : IF offset    > 15  THEN DEC(offset,16) END
+    | 'B' : IF offset+16 < 512 THEN INC(offset,16) END
+    | 'C' : IF offset+1  < 512 THEN INC(offset)    END
+    | 'D' : IF offset    > 0   THEN DEC(offset)    END
+    | '5' : ChangeSector(TRUE)
+    | '6' : ChangeSector(FALSE)
+    END;
+    SetXY(offset);
+  END
+END ReadCommand;
+
+PROCEDURE ChangeByte;
+VAR char2: CHAR;
+BEGIN
+  Terminal.Char(CAP(char));
+  REPEAT
+    char2 := CAP(Terminal.Get());
+  UNTIL (char2>='0') AND (char2<='9')
+     OR (char2>='A') AND (char2<='F') OR (char2 = ESC);
+  IF char2 = ESC THEN View(sectStart); SetXY(offset)
+  ELSE
+    Terminal.Char(char2);
+    mem[sectStart+offset] := hexVal(char) * 16 + hexVal(char2);
+    dirty := TRUE;
+    Terminal.GotoXY(58 + offset MOD 16, offset DIV 16); ViewChar(mem[sectStart+offset]);
+    INC(offset); IF offset = 512 THEN offset := 0 END;
+    SetXY(offset)
+  END
+END ChangeByte;
+
+BEGIN
+  file := Files.Old(ComLine.arg1);
+  IF ComLine.arg1 = "" THEN Terminal.String("Usage: hexedit filename")
+  ELSIF file = NIL     THEN Terminal.String("Cannot open file.")
+  ELSE
+    ReadFile;
+    sectStart := 0;
+    offset    := 0;
+    View(sectStart);
+    SetXY(offset);
+    REPEAT
+      char := CAP(Terminal.Get());
+      IF char = ESC THEN ReadCommand
+      ELSIF (char >= '0') & (char <= '9') OR (char >= 'A') & (char <= 'F') THEN ChangeByte
+      ELSIF char = 'X' THEN Terminal.ClearScreen; CloseFile; exit := TRUE
+      ELSIF char = 'Q' THEN
+        Terminal.ClearScreen;
+        IF dirty THEN
+          Terminal.String('Buffer has been modified, abandon changes ? (Y/N) ');
+          IF CAP(Terminal.Get())='N' THEN CloseFile END
+        END;
+        exit := TRUE
+      END
+    UNTIL exit
+  END
+END HexEdit.

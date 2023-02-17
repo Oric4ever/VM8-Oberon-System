@@ -1,0 +1,8 @@
+MODULE Reboot;
+IMPORT SYSTEM, FAT32;
+VAR dummy: INTEGER;
+BEGIN
+  FAT32.UnmountFS;
+  dummy := SYSTEM.SYS(0,0)
+END Reboot.
+

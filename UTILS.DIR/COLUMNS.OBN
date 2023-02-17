@@ -1,0 +1,7 @@
+MODULE Columns;
+IMPORT Terminal, Out;
+BEGIN
+  Out.String('Terminal width is');
+  Out.Int(Terminal.numCols, 4);
+  Out.Ln
+END Columns.

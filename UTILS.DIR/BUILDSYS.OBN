@@ -1,0 +1,182 @@
+MODULE BuildSystem;
+IMPORT SYSTEM, Strings, Files, ComLine, Streams, Out, Scan;
+
+(* $X+ *)
+
+TYPE FileName   = ARRAY 16 OF CHAR;
+     ModuleName = ARRAY  8 OF CHAR;
+     ModuleDesc = RECORD
+                    dependencies: ARRAY 32 OF INTEGER;
+                    link        : INTEGER;
+                    name        : ModuleName;
+                    reserved    : INTEGER;
+                    version     : INTEGER;
+                    procTable   : INTEGER;
+                  END;
+     Module     = RECORD
+                    desc        : ModuleDesc;
+                    flags       : BYTE;
+                    nbOfVars    : BYTE;
+                    reserved,
+                    nbDependencies: BYTE;
+                    vars        : ARRAY 126 OF INTEGER;
+                  END;
+     ModulePtr  = POINTER TO Module;
+
+VAR
+    memImage : ARRAY 32000 OF BYTE;
+    buffer   : ARRAY  8000 OF BYTE;
+    memStart,
+    loadBase : INTEGER;
+    modTable : ARRAY 32 OF INTEGER;
+    modNames : ARRAY 32 OF ModuleName;
+    versions : ARRAY 32 OF INTEGER;
+    nbModules: INTEGER;
+
+PROCEDURE NotFound(name: ARRAY OF CHAR);
+BEGIN
+  Out.String(name);
+  Out.String(" not found...");
+  Out.Ln;
+END NotFound;
+
+PROCEDURE MemWord(addr: INTEGER): INTEGER;
+(* $O- don't check integer overflows *)
+BEGIN
+  RETURN ORD(memImage[addr]) + ORD(memImage[addr+1]) * 256
+(* $O+ *)
+END MemWord;
+
+PROCEDURE SetMemWord(addr, value: INTEGER);
+BEGIN
+  memImage[addr  ] := value MOD 256;
+  memImage[addr+1] := value DIV 256;
+END SetMemWord;
+
+PROCEDURE FindModule(name: ModuleName): INTEGER;
+VAR i, module: INTEGER;
+BEGIN
+  module := -1;
+  FOR i := 0 TO nbModules-1 DO
+    IF modNames[i] = name THEN module := i END
+  END;
+  RETURN module
+END FindModule;
+
+PROCEDURE LoadModule(VAR rider: Files.Rider);
+VAR i,j, varSize: INTEGER;
+    dependMod   : INTEGER;
+    module      : ModulePtr;
+    fileSize, moduleAddr, codeSize, nbDependencies: INTEGER;
+    reserved    : INTEGER;
+    dependName  : ModuleName;
+    version     : INTEGER;
+    location    : INTEGER;
+    byte        : BYTE;
+BEGIN
+  Files.ReadInt(rider, fileSize);
+  Files.ReadInt(rider, moduleAddr);
+  Files.ReadInt(rider, codeSize);
+  Files.ReadInt(rider, nbDependencies);
+  FOR i := 1 TO 4 DO Files.ReadInt(rider, reserved) END;
+  ASSERT( codeSize < LEN(buffer) );
+  ASSERT( loadBase + codeSize < LEN(memImage) );
+
+  Files.ReadBytes(rider, buffer, codeSize);
+  ASSERT( rider.res = 0 );
+  SYSTEM.COPY(SYSTEM.ADR(buffer), memStart + loadBase, codeSize);
+
+  module := SYSTEM.VAL(ModulePtr, memStart + moduleAddr + loadBase);
+  module.desc.procTable := module.desc.procTable + loadBase;
+
+  modNames[nbModules] := module.desc.name;
+  modTable[nbModules] := loadBase + moduleAddr;
+  versions[nbModules] := module.desc.version;
+  FOR i := 1 TO nbDependencies DO
+    FOR j := 0 TO 7 DO Files.Read(rider, byte); dependName[j] := CHR(byte) END;
+    Files.ReadInt(rider, version);
+    Files.ReadInt(rider, location);
+    dependMod := FindModule(dependName);
+    IF dependMod < 0 THEN
+      Out.String(module.desc.name);
+      Out.String(" requires missing module ");
+      Out.String(dependName);
+      Out.Ln
+    ELSIF versions[dependMod] # version THEN
+      Out.String(module.desc.name);
+      Out.String(" depends on older version of ");
+      Out.String(dependName);
+      Out.Ln
+    ELSE
+      SetMemWord(location + loadBase, modTable[dependMod]+SYSTEM.SIZE(ModuleDesc))
+    END
+  END;
+  loadBase := loadBase + codeSize;
+
+  (* now allocate the records and arrays of the module *)
+  FOR i := 0 TO module.nbOfVars-1 DO␍
+    IF module.vars[i] # 0 THEN␍
+      varSize := module.vars[i];
+      module.vars[i] := loadBase;
+      FOR j := 1 TO varSize DO memImage[loadBase] := 0; INC(loadBase) END;
+    END
+  END;
+
+  INC(nbModules);
+END LoadModule;
+
+PROCEDURE LoadModules(): BOOLEAN;
+VAR filename: FileName;
+    modfile : Files.File;
+    rider   : Files.Rider;
+BEGIN
+  memStart := SYSTEM.ADR(memImage);
+  loadBase := 0500H;
+  WHILE NOT Streams.End(Streams.input) DO
+    Scan.Line(Streams.input, filename);
+    Out.String("Loading ");
+    Out.String(filename);
+    Out.Ln;
+    modfile   := Files.Old(filename);
+    IF modfile = NIL THEN NotFound(filename); RETURN FALSE END;
+    Files.Set  (rider, modfile, LONG(0));
+    LoadModule (rider);
+    Files.Close(modfile);
+  END;
+  RETURN TRUE
+END LoadModules;
+
+PROCEDURE ChainModules;
+VAR i: INTEGER;
+    module: ModulePtr;
+BEGIN
+  FOR i := 0 TO nbModules-2 DO
+    module := SYSTEM.VAL(ModulePtr, memStart + modTable[i]);
+    module.desc.link := modTable[i+1]
+  END
+END ChainModules;
+
+PROCEDURE WriteSystem(name: ARRAY OF CHAR);
+VAR system: Files.File;
+    rider : Files.Rider;
+BEGIN
+  system := Files.New(name);
+  Files.Set       (rider, system, LONG(0));
+  Files.WriteBytes(rider, memImage, loadBase);
+  Files.Register  (system);
+  Files.Close     (system)
+END WriteSystem;
+
+BEGIN
+  IF ComLine.arg1 = "" THEN
+    Out.String("Usage: buildsys system_file <module_list_file");
+    Out.Ln
+  ELSIF LoadModules() THEN
+    ChainModules;
+    SetMemWord(030CH, modTable[0]);  (* TODO: change this *)
+    SetMemWord(010CH, modTable[0]);
+    SetMemWord(0316H, loadBase + 60);
+    WriteSystem(ComLine.arg1)
+  END
+END BuildSystem.
+

@@ -1,0 +1,6 @@
+MODULE Bell;
+IMPORT Terminal;
+CONST BELL = 07X;
+BEGIN
+  Terminal.Char(BELL)
+END Bell.

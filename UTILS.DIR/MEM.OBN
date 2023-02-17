@@ -1,0 +1,11 @@
+MODULE Mem;
+IMPORT SYSTEM, Terminal;
+VAR free: INTEGER;
+BEGIN
+  free := SYSTEM.FREEMEM();
+  Terminal.Num(free DIV 1024 + 64); (* free is negative *)
+  Terminal.String(" KB, ");
+  Terminal.Num(free MOD 1024);
+  Terminal.String(" bytes free");
+  Terminal.Ln
+END Mem.

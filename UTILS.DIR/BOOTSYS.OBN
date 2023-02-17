@@ -1,0 +1,7 @@
+MODULE BootSys;
+IMPORT SYSTEM, RunSys;
+VAR result: INTEGER;
+BEGIN
+  SYSTEM.COPY(SYSTEM.ADR(RunSys.SystemImage)+0100H, 0100H, LEN(RunSys.SystemImage)-0100H);
+  result := SYSTEM.SYS(0,0)
+END BootSys.
