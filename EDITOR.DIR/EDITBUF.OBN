@@ -1,0 +1,367 @@
+MODULE EditBuf;
+IMPORT SYSTEM, Strings;
+
+CONST CTRLC = 03X; TAB = 09X; LF = 0AX; CR = 0DX; ESC = 1BX; SPACE = 20X; DEL = 7FX;
+      MAXSIZE = 32500;
+      (* CharType : *)
+      CRLF = 0; CONTROL = 1; OTHER = 2; ALPHANUM = 3;
+      NBCOMMANDS = 46;
+(* $X+ *)
+(* $T- *)
+
+VAR
+(* CAUTION: these two variables should remain together *)
+bufferAddr*      : INTEGER;
+editBuffer*      : ARRAY 1 OF CHAR; (* replaced at initialization *)
+
+beforeCursor*    : INTEGER;
+afterCursor*     : INTEGER;
+editStart        : INTEGER;
+editEnd*         : INTEGER;
+selectionStart*  : INTEGER;
+selectionEnd*    : INTEGER;
+currentCol*      : INTEGER;
+currentLine*     : INTEGER;
+bufferModified*  : BOOLEAN;
+autoIndent*      : BOOLEAN;
+insertMode       : BOOLEAN;
+pendingDeleteChar: BOOLEAN;
+
+PROCEDURE FindForward*(start: INTEGER; char: CHAR): INTEGER;
+VAR index: INTEGER;
+BEGIN
+  FOR index := start TO editEnd DO
+    IF editBuffer[index] = char THEN RETURN index END
+  END;
+  RETURN 0
+END FindForward;
+
+PROCEDURE FindBackward*(start: INTEGER; char: CHAR): INTEGER;
+VAR index: INTEGER;
+BEGIN
+  FOR index := start TO editStart BY -1 DO
+    IF editBuffer[index] = char THEN RETURN index END
+  END;
+  RETURN 0
+END FindBackward;
+
+PROCEDURE findStartOfLine*(index: INTEGER): INTEGER;
+BEGIN RETURN FindBackward(index, LF) + 1
+END findStartOfLine;
+
+PROCEDURE findNextLine*(index: INTEGER): INTEGER;
+BEGIN RETURN FindForward(index, LF) + 1
+END findNextLine;
+
+PROCEDURE charCount*(index: INTEGER): INTEGER;
+BEGIN RETURN index - editStart
+END charCount;
+
+PROCEDURE NbLinesBetween*(index1, index2: INTEGER): INTEGER;
+VAR nbLines: INTEGER;
+BEGIN
+  nbLines := 0;
+  index1 := findNextLine(index2);
+  WHILE index1 <= index2 + 1 DO
+    INC(nbLines);
+    index1 := findNextLine(index1);
+  END;
+  RETURN nbLines;
+END NbLinesBetween;
+
+(* added for UTF8 *)
+PROCEDURE charSize*(index: INTEGER): INTEGER;
+VAR firstByte: CHAR;
+BEGIN
+  firstByte := editBuffer[index];
+  IF firstByte < CHR(0C0H) THEN RETURN 1 END;
+  IF firstByte < CHR(0E0H) THEN RETURN 2 END;
+  RETURN 3
+END charSize;
+
+PROCEDURE UpdateColumn*;
+VAR index: INTEGER;
+BEGIN
+  currentCol := 0;
+  index := findStartOfLine(beforeCursor - 1);
+  WHILE index # beforeCursor DO
+    INC(currentCol);
+    index := index + charSize(index);
+  END;
+END UpdateColumn;
+
+PROCEDURE charType*(index: INTEGER): INTEGER;
+VAR char: CHAR;
+BEGIN
+  char := CAP(editBuffer[index]);
+  IF (char >= 'A') & (char <= 'Z') OR (char >= '0') & (char <= '9') THEN
+    RETURN ALPHANUM
+  END;
+  IF char > SPACE THEN RETURN OTHER END;
+  IF char = LF    THEN RETURN CRLF END;
+  RETURN CONTROL;
+END charType;
+
+PROCEDURE MoveBytesAfterCursorToBefore*(count: INTEGER);
+VAR oldAfter: INTEGER;
+BEGIN
+  oldAfter := afterCursor;
+  SYSTEM.COPY(bufferAddr + afterCursor, bufferAddr + beforeCursor, count);
+  beforeCursor := beforeCursor + count;
+  afterCursor  := afterCursor + count;
+  IF (selectionStart >= oldAfter) AND (selectionStart < afterCursor) THEN
+    selectionStart := selectionStart - (afterCursor - beforeCursor);
+  END;
+  IF (selectionEnd > oldAfter) AND (selectionEnd <= afterCursor) THEN
+    selectionEnd := selectionEnd - (afterCursor - beforeCursor);
+  END;
+END MoveBytesAfterCursorToBefore;
+
+PROCEDURE MoveBytesBeforeCursorToAfter*(count: INTEGER);
+VAR oldBefore: INTEGER;
+BEGIN
+  oldBefore    := beforeCursor;
+  afterCursor  := afterCursor - count;
+  beforeCursor := beforeCursor - count;
+  SYSTEM.COPY(bufferAddr + beforeCursor, bufferAddr + afterCursor, count);
+  IF (selectionStart >= beforeCursor) AND (selectionStart < oldBefore) THEN
+    selectionStart := selectionStart + (afterCursor - beforeCursor)
+  END;
+  IF (selectionEnd > beforeCursor) AND (selectionEnd <= oldBefore) THEN
+    selectionEnd := selectionEnd + (afterCursor - beforeCursor)
+  END;
+END MoveBytesBeforeCursorToAfter;
+
+PROCEDURE insertChar*(code: INTEGER);(* code: 16-bit Unicode, converted to UTF-8 *)
+VAR char : CHAR;
+    index, charLength : INTEGER;
+BEGIN
+  (* char length can be up to 3, don't do insertion if hole is too small *)
+  IF beforeCursor + 3 >= afterCursor THEN RETURN END;
+
+  IF code < 0080H THEN
+    charLength := 1;
+    editBuffer[beforeCursor] := CHR(code);
+    IF CHR(code) = CR THEN
+      editBuffer[beforeCursor] := LF;
+      INC(beforeCursor);
+      INC(currentLine);
+      currentCol := 0;
+      IF autoIndent THEN
+        index := findStartOfLine(beforeCursor - 2); (* start of previous line *)
+        WHILE editBuffer[index] = SPACE DO
+          IF beforeCursor + 1 >= afterCursor THEN RETURN END; (* no space anymore *)
+          editBuffer[beforeCursor] := char;
+          INC(beforeCursor); INC(currentCol); INC(index)
+        END
+      END
+    END
+  ELSIF code < 0800H THEN
+    charLength := 2;
+    editBuffer[beforeCursor+0] := CHR(code DIV 64 + 0C0H);
+    editBuffer[beforeCursor+1] := CHR(code MOD 64 + 080H);
+  ELSE
+    charLength := 3;
+    editBuffer[beforeCursor+0] := CHR(code DIV 4096 + 0E0H);
+    editBuffer[beforeCursor+1] := CHR(code DIV 64 MOD 64 + 080H);
+    editBuffer[beforeCursor+2] := CHR(code MOD 64 + 080H);
+  END;
+
+  (* overwrite mode eats the next char, except when at the end of a line... *)
+  IF (NOT insertMode) AND (editBuffer[afterCursor] # LF) THEN
+    afterCursor := afterCursor + charSize(afterCursor);
+  END;
+
+  (* store the char also just before afterCursor in order to display end of line *)
+  index := afterCursor - charLength;
+  SYSTEM.COPY(bufferAddr + beforeCursor, bufferAddr + index, charLength);
+  beforeCursor := beforeCursor + charLength;
+  INC(currentCol);
+END insertChar;
+
+PROCEDURE cursorLeft*;
+BEGIN
+  IF beforeCursor <= editStart THEN RETURN END;
+  IF currentCol = 0 THEN
+    MoveBytesBeforeCursorToAfter(1);
+    DEC(currentLine);
+    UpdateColumn;
+  ELSE
+    REPEAT  (* UTF8 variable-sized chars *)
+      MoveBytesBeforeCursorToAfter(1)
+    UNTIL (ORD(editBuffer[afterCursor]) < 080H) OR (ORD(editBuffer[afterCursor]) >= 0C0H);
+    IF editBuffer[beforeCursor] = TAB THEN UpdateColumn ELSE DEC(currentCol) END;
+  END;
+END cursorLeft;
+
+PROCEDURE cursorRight*;
+BEGIN
+  IF editBuffer[afterCursor] = LF THEN
+    IF afterCursor # editEnd THEN
+      MoveBytesAfterCursorToBefore(1);
+      INC(currentLine);
+      currentCol := 0;
+    END;
+  ELSE
+    INC(currentCol);
+    (* UTF8 variable-sized chars *)
+    MoveBytesAfterCursorToBefore(charSize(afterCursor));
+  END;
+END cursorRight;
+
+PROCEDURE startOfLine*;
+BEGIN WHILE currentCol # 0 DO cursorLeft END
+END startOfLine;
+
+PROCEDURE endOfLine*;
+BEGIN WHILE editBuffer[afterCursor] # LF DO cursorRight END
+END endOfLine;
+
+PROCEDURE deleteRightChar*;
+BEGIN
+  IF selectionStart = afterCursor THEN INC(selectionStart) END;
+  afterCursor := afterCursor + charSize(afterCursor);
+  IF selectionEnd = afterCursor THEN selectionEnd := beforeCursor END;
+END deleteRightChar;
+
+PROCEDURE wordLeft*;
+VAR type, wordType : INTEGER;
+BEGIN
+  WHILE charType(beforeCursor - 1) = CONTROL DO cursorLeft END;
+  wordType := charType(beforeCursor - 1);
+  REPEAT
+    cursorLeft;
+    type := charType(beforeCursor - 1);
+  UNTIL (type # wordType) OR (type = CRLF);
+END wordLeft;
+
+PROCEDURE wordRight*;
+VAR type, wordType : INTEGER;
+BEGIN
+  wordType := charType(afterCursor);
+  REPEAT
+    cursorRight;
+    type := charType(afterCursor);
+  UNTIL (type # wordType) OR (type = CRLF);
+  WHILE charType(afterCursor) = CONTROL DO cursorRight END;
+END wordRight;
+
+(*
+PROCEDURE deleteRightWord*;
+VAR type : INTEGER;
+BEGIN
+  type := charType(afterCursor);
+  IF type = CRLF THEN deleteLineReturn; RETURN END;
+  REPEAT deleteRightChar UNTIL charType(afterCursor) # type;
+  WHILE charType(afterCursor) = CONTROL DO deleteRightChar END;
+END deleteRightWord;
+*)
+
+(* added for UTF8 *)
+PROCEDURE reachCurrentColumn*(index: INTEGER): INTEGER;
+VAR oldColumn, column : INTEGER;
+BEGIN
+  oldColumn  := currentCol;
+  currentCol := 0;   WHILE (currentCol # oldColumn) AND (editBuffer[index] # LF) DO
+    index := index + charSize(index);
+    INC(currentCol);
+  END;
+  RETURN index
+END reachCurrentColumn;
+
+PROCEDURE lineUp*;
+VAR index, oldColumn, column : INTEGER;
+BEGIN
+  index := findStartOfLine(beforeCursor - 1);
+  IF index > editStart THEN
+    index := reachCurrentColumn( findStartOfLine(index - 2) );
+    MoveBytesBeforeCursorToAfter(beforeCursor - index);
+    DEC(currentLine);
+  END
+END lineUp;
+
+PROCEDURE lineDown*;
+VAR index: INTEGER;
+BEGIN
+  index := findNextLine(afterCursor);
+  IF index <= editEnd THEN
+    index := reachCurrentColumn(index);
+    MoveBytesAfterCursorToBefore(index - afterCursor);
+    INC(currentLine);
+  END
+END lineDown;
+
+PROCEDURE goToLine*(line: INTEGER): INTEGER;
+VAR index: INTEGER;
+BEGIN
+  IF line < currentLine THEN (* TODO: replace by goto beginning of file *)
+    MoveBytesBeforeCursorToAfter(beforeCursor - editStart);
+    currentLine := 1;
+  END;
+  index := findStartOfLine(beforeCursor); (* go to beginning of line *)
+  WHILE (index < editEnd) & (currentLine < line) DO
+    index := findNextLine(index);
+    IF index < editEnd THEN INC(currentLine) ELSE index := editEnd END
+  END;
+  MoveBytesAfterCursorToBefore(index - afterCursor);
+  RETURN index
+END goToLine;
+
+PROCEDURE deleteLine*;
+BEGIN
+  startOfLine;
+  WHILE editBuffer[afterCursor] # LF DO deleteRightChar END;
+  deleteRightChar; (* delete LF *)
+  currentCol := 0;
+END deleteLine;
+
+PROCEDURE pageUp*(pageHeight: INTEGER);
+VAR i: INTEGER;
+BEGIN
+  FOR i := 1 TO pageHeight DO lineUp END
+END pageUp;
+
+PROCEDURE pageDown*(pageHeight: INTEGER);
+VAR i: INTEGER;
+BEGIN
+  FOR i := 1 TO pageHeight DO lineDown END
+END pageDown;
+
+PROCEDURE goToStart*;
+BEGIN MoveBytesBeforeCursorToAfter(beforeCursor - editStart)
+END goToStart;
+
+PROCEDURE goToEnd*;
+BEGIN MoveBytesAfterCursorToBefore(editEnd - afterCursor)
+END goToEnd;
+
+PROCEDURE ToggleInsert*;
+BEGIN insertMode := NOT insertMode
+END ToggleInsert;
+
+PROCEDURE ToggleIndent*;
+BEGIN autoIndent := NOT autoIndent
+END ToggleIndent;
+
+PROCEDURE Init*(buffer: ARRAY OF CHAR; indent, insert: BOOLEAN);
+VAR contentSize: INTEGER;
+BEGIN
+  autoIndent     := indent;
+  insertMode     := insert;
+  bufferModified := FALSE;
+  selectionEnd   := 0;
+  selectionStart := 0;
+  currentLine    := 1;
+  currentCol     := 0;
+  bufferAddr     := SYSTEM.ADR(buffer);
+  SYSTEM.COPY(SYSTEM.ADR(bufferAddr), SYSTEM.ADR(bufferAddr)+2, 2);
+  editEnd        := LEN(buffer);
+  editStart      := 0;
+  contentSize    := Strings.Length(buffer);
+  beforeCursor   := contentSize;
+  afterCursor    := editEnd;
+  MoveBytesBeforeCursorToAfter(contentSize);
+END Init;
+
+END EditBuf.
+

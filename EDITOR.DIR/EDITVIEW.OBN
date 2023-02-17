@@ -1,0 +1,960 @@
+MODULE EditView;
+IMPORT SYSTEM, Terminal, Strings, Files, Format;
+
+CONST CTRLC = 03X; TAB = 09X; LF = 0AX; CR = 0DX; ESC = 1BX; SPACE = 20X; DEL = 7FX;
+      MAXSIZE = 32500;
+      (* CharType : *)
+      CRLF = 0; CONTROL = 1; OTHER = 2; ALPHANUM = 3;
+      NBCOMMANDS = 46;
+(* $X+ *)
+(* $T- *)
+(* $O- *)
+TYPE ADDRESS = INTEGER;
+     BUFFER  = ARRAY 1 OF BYTE;
+
+VAR
+(* CAUTION, editBuffer must be the variable just after bufferAddr *)
+bufferAddr        : ADDRESS;
+editBuffer        : ARRAY 1 OF CHAR;
+
+beforeCursor*     : INTEGER;
+afterCursor*      : INTEGER;
+editStart*        : INTEGER;
+editEnd*          : INTEGER;
+selectionStart    : INTEGER;
+selectionEnd      : INTEGER;
+currentCol*       : INTEGER;
+currentRow*       : INTEGER;
+currentFileLine*  : INTEGER;
+lastRow*          : INTEGER;
+lastColumn*       : INTEGER;
+bufferModified*   : BOOLEAN;
+autoIndent*       : BOOLEAN;
+screenRefreshed   : BOOLEAN;
+endScreenRefreshed: BOOLEAN;
+dontRefreshStatus : BOOLEAN;
+insertMode*       : BOOLEAN;
+pendingDeleteChar*: BOOLEAN;
+
+fileName          : ARRAY  12 OF CHAR;
+fileNameLength    : INTEGER;
+statusLine        : ARRAY  80 OF CHAR;
+rowsLengths       : ARRAY 100 OF INTEGER;
+clipBuffer        : ARRAY 512 OF BYTE; (* sector buffer for selection *)
+
+PROCEDURE FindForward*(from: INTEGER; char: CHAR): INTEGER;
+BEGIN
+  RETURN from + SYSTEM.SCAN(bufferAddr + from, editEnd - from, ORD(char))
+END FindForward;
+
+PROCEDURE FindBackward*(start: INTEGER; char: CHAR): INTEGER;
+VAR index: INTEGER;
+BEGIN
+  FOR index := start TO editStart BY -1 DO
+    IF editBuffer[index] = char THEN RETURN index END
+  END;
+  RETURN editStart-1
+END FindBackward;
+
+PROCEDURE Print(index, indexLimit, column, columnLimit: INTEGER): INTEGER;
+VAR char: CHAR;
+BEGIN
+  WHILE (column < columnLimit) & (index < indexLimit) DO
+    char := editBuffer[index]; INC(index);
+    IF char = LF THEN RETURN column END;
+    IF char <= DEL THEN
+      IF char < SPACE THEN
+        Terminal.Char(CHR(0E2H));
+        Terminal.Char(CHR(090H));
+        Terminal.Char(CHR(ORD(char) + 080H));
+      ELSE
+        Terminal.Char(char)
+      END
+    ELSE (* UTF-8 chars *)
+      IF    ORD(char) < 0C2H THEN Terminal.Char('?')
+      ELSIF ORD(char) < 0E0H THEN
+        Terminal.Char(char);
+        Terminal.Char(editBuffer[index]); INC(index)
+      ELSE
+        Terminal.Char(char);
+        Terminal.Char(editBuffer[index]);
+        Terminal.Char(editBuffer[index+1]); INC(index, 2)
+      END
+    END;
+    INC(column);
+  END;
+  RETURN column;
+END Print;
+
+(* redraw end of line, taking care to highlight current selection  *)
+PROCEDURE PrintWithSelectionHighlighted(index: INTEGER; column,limit : INTEGER): INTEGER;
+VAR endOfLine: INTEGER;
+    savedChar: CHAR;
+BEGIN
+    endOfLine := FindForward(index, LF);
+    IF (selectionStart < endOfLine) AND (selectionEnd > index) THEN (* intersects selection *)
+      IF selectionStart > index THEN (* there is a first part to write that is not selected *)
+        column    := Print(index, selectionStart, column, limit);
+        index     := selectionStart;
+      END;
+      Terminal.Highlight; (* next part is selected *)
+      IF selectionEnd < endOfLine THEN (* there will be a final part not selected *)
+        column    := Print(index, selectionEnd, column, limit);
+        index     := selectionEnd;
+        Terminal.Normal;
+      END;
+      column := Print(index, endOfLine, column, limit);
+      Terminal.Normal;
+      RETURN column;
+    END;
+  RETURN Print(index, endOfLine, column, limit)
+END PrintWithSelectionHighlighted;
+
+(* redraw the end of the line *)
+PROCEDURE RefreshEndOfLine*(index: INTEGER; column, row: INTEGER);
+VAR finalColumn: INTEGER;
+BEGIN
+(*
+  IF (rowsLengths[row] # 0) OR (editBuffer[index] # LF) THEN
+*)
+    Terminal.GotoXY(column, row);
+    finalColumn := PrintWithSelectionHighlighted(index, column, lastColumn);
+    Terminal.ClearToEOL;
+    rowsLengths[row] := finalColumn;
+(*
+  ELSE
+    rowsLengths[row] := column
+  END;
+*)
+END RefreshEndOfLine;
+
+PROCEDURE PrintOnStatusLine*(str: ARRAY OF CHAR; column: INTEGER);
+BEGIN
+  Terminal.GotoXY(column, 0);
+  Terminal.Highlight;
+  Terminal.String(str);
+  dontRefreshStatus := TRUE;
+(*
+  Terminal.Normal;
+  Terminal.ClearToEOL
+*)
+END PrintOnStatusLine;
+
+PROCEDURE findStartOfLine*(index: INTEGER): INTEGER;
+BEGIN RETURN FindBackward(index, LF) + 1
+END findStartOfLine;
+
+PROCEDURE findNextLine*(index: INTEGER): INTEGER;
+BEGIN RETURN FindForward(index, LF) + 1
+END findNextLine;
+
+PROCEDURE charCount*(index: INTEGER): INTEGER;
+BEGIN RETURN index - editStart
+END charCount;
+
+PROCEDURE RefreshFullLine*;
+VAR dummy : INTEGER;
+BEGIN
+  editBuffer[beforeCursor] := LF;
+  Terminal.GotoXY(0,currentRow);
+  dummy := PrintWithSelectionHighlighted(findStartOfLine(beforeCursor-1), 0, lastColumn);
+  RefreshEndOfLine(afterCursor, currentCol, currentRow);
+END RefreshFullLine;
+
+PROCEDURE buildStatusLine*;
+VAR emptyField   : ARRAY 6 OF CHAR;
+    overwriteMsg : ARRAY 9 OF CHAR;
+    lineString   : ARRAY 6 OF CHAR;
+    percentString: ARRAY 5 OF CHAR;
+    i, size, percent: INTEGER;
+BEGIN
+  Format.Int(currentFileLine, lineString);
+  size    := charCount(beforeCursor) + editEnd - afterCursor;
+  percent := 0;
+  IF size # 0 THEN
+    percent := INT(LONG(charCount(beforeCursor)) * LONG(100) DIV LONG(size))
+  END;
+  Format.Int(percent, percentString);
+  PrintOnStatusLine("      ", 0);
+  Terminal.String(fileName);
+  IF autoIndent
+  THEN Terminal.String(" Indent ")
+  ELSE Terminal.String("        ")
+  END;
+  IF insertMode
+  THEN Terminal.String(" Insert    ")
+  ELSE Terminal.String(" Overwrite ")
+  END;
+  Terminal.String(lineString);
+  Terminal.Char  (',');
+  Terminal.Num   (currentCol);
+  IF currentCol <  10 THEN Terminal.Char(' ') END;
+  IF currentCol < 100 THEN Terminal.Char(' ') END;
+  Terminal.String(percentString);
+  Terminal.Char  ('%');
+  Terminal.Normal;
+  Terminal.ClearToEOL;
+END buildStatusLine;
+
+PROCEDURE KeyAvailable(): BOOLEAN;
+BEGIN RETURN Terminal.HasKey()
+END KeyAvailable;
+
+PROCEDURE RefreshScreen*;
+VAR index, row : INTEGER;
+BEGIN
+  endScreenRefreshed := TRUE;
+  screenRefreshed    := FALSE;
+  RefreshFullLine; (* refresh line of cursor first *)
+  index := findStartOfLine(beforeCursor - 1);
+  FOR row := currentRow-1 TO 1 BY -1 DO
+    index := findStartOfLine(index - 2);
+  END;
+  FOR row := 1 TO lastRow DO
+    IF KeyAvailable() THEN RETURN END;
+    IF row = currentRow 
+    THEN index := afterCursor
+    ELSE RefreshEndOfLine(index, 0, row)
+    END;
+    index := findNextLine(index);
+  END;
+  screenRefreshed := TRUE;
+END RefreshScreen;
+
+PROCEDURE RefreshEndOfScreen;
+VAR index,row: INTEGER;
+BEGIN
+  IF NOT screenRefreshed THEN RefreshScreen; RETURN END;
+  index := afterCursor;
+  endScreenRefreshed := FALSE;
+  RefreshFullLine;
+  row := currentRow;
+  WHILE (row < lastRow) AND NOT KeyAvailable() DO
+    INC(row);
+    index := findNextLine(index);
+    RefreshEndOfLine(index, 0, row);
+  END;
+  endScreenRefreshed := row >= lastRow;
+END RefreshEndOfScreen;
+
+PROCEDURE NbOfLinesBetween*(index1, index2: INTEGER): INTEGER;
+VAR nbLines: INTEGER;
+BEGIN
+  nbLines := 0;
+  REPEAT
+    INC(nbLines);
+    index1 := findNextLine(index1);
+  UNTIL index1 >= index2;
+  RETURN nbLines;
+END NbOfLinesBetween;
+
+(* added for UTF8 *)
+PROCEDURE charSize(index: INTEGER): INTEGER;
+VAR firstByte: CHAR;
+BEGIN
+  firstByte := editBuffer[index];
+  IF firstByte < CHR(0C0H) THEN RETURN 1 END;
+  IF firstByte < CHR(0E0H) THEN RETURN 2 END;
+  RETURN 3
+END charSize;
+
+PROCEDURE UpdateColumn*;
+VAR index: INTEGER;
+BEGIN
+  currentCol := 0;
+  index := findStartOfLine(beforeCursor - 1);
+  WHILE index # beforeCursor DO
+    INC(currentCol);
+    index := index + charSize(index);
+  END;
+END UpdateColumn;
+
+PROCEDURE charType(index: INTEGER): INTEGER;
+VAR char: CHAR;
+BEGIN
+  char := CAP(editBuffer[index]);
+  IF (char >= 'A') & (char <= 'Z') OR (char >= '0') & (char <= '9') THEN
+    RETURN ALPHANUM
+  END;
+  IF char > SPACE THEN RETURN OTHER END;
+  IF char = LF    THEN RETURN CRLF END;
+  RETURN CONTROL;
+END charType;
+
+PROCEDURE MoveBytesAfterCursorToBefore*(count: INTEGER);
+VAR oldAfter: INTEGER;
+BEGIN
+  oldAfter := afterCursor;
+  SYSTEM.COPY(bufferAddr + afterCursor, bufferAddr + beforeCursor, count);
+  beforeCursor := beforeCursor + count;
+  afterCursor  := afterCursor + count;
+  IF (selectionStart >= oldAfter) AND (selectionStart < afterCursor) THEN
+    selectionStart := selectionStart - (afterCursor - beforeCursor);
+  END;
+  IF (selectionEnd > oldAfter) AND (selectionEnd <= afterCursor) THEN
+    selectionEnd := selectionEnd - (afterCursor - beforeCursor);
+  END;
+END MoveBytesAfterCursorToBefore;
+
+PROCEDURE MoveBytesBeforeCursorToAfter*(count: INTEGER);
+VAR oldBefore: INTEGER;
+BEGIN
+  oldBefore    := beforeCursor;
+  afterCursor  := afterCursor - count;
+  beforeCursor := beforeCursor - count;
+  SYSTEM.COPY(bufferAddr + beforeCursor, bufferAddr + afterCursor, count);
+  IF (selectionStart >= beforeCursor) AND (selectionStart < oldBefore) THEN
+    selectionStart := selectionStart + (afterCursor - beforeCursor)
+  END;
+  IF (selectionEnd > beforeCursor) AND (selectionEnd <= oldBefore) THEN
+    selectionEnd := selectionEnd + (afterCursor - beforeCursor)
+  END;
+END MoveBytesBeforeCursorToAfter;
+
+PROCEDURE scrollUpRowsLengths(line: INTEGER);
+VAR i: INTEGER;
+BEGIN
+  FOR i := lastRow TO line BY -1 DO rowsLengths[line] := rowsLengths[line-1] END;
+  rowsLengths[line] := 0;
+END scrollUpRowsLengths;
+
+PROCEDURE scrollDownRowsLengths(line: INTEGER);
+BEGIN
+  WHILE line < lastRow DO rowsLengths[line] := rowsLengths[line+1]; INC(line) END;
+  rowsLengths[lastRow] := 0;
+END scrollDownRowsLengths;
+
+PROCEDURE insertChar*(code: INTEGER);(* code: 16-bit Unicode *)
+VAR index : INTEGER;
+    char : CHAR;
+    charLength : INTEGER;
+BEGIN
+  (* char length can be up to 3, don't do insertion if hole is too small *)
+  IF beforeCursor + 3*2 >= afterCursor THEN RETURN END;
+  bufferModified := TRUE; selectionStart := 0; selectionEnd := 0;
+  IF code < 0080H THEN
+    charLength := 1;
+    editBuffer[beforeCursor] := CHR(code);
+    IF CHR(code) = CR THEN
+      editBuffer[beforeCursor] := LF;
+      RefreshEndOfLine(beforeCursor, currentCol, currentRow);
+      INC(beforeCursor);
+      INC(currentFileLine);
+      currentCol := 0;
+      INC(currentRow);
+      Terminal.Ln; (* moves the screen cursor to first column of next line *)
+      IF autoIndent THEN
+        index := findStartOfLine(beforeCursor - 2); (* start of previous line *)
+        WHILE editBuffer[index] = SPACE DO
+          IF beforeCursor + 1 >= afterCursor THEN RETURN END; (* no space anymore *)
+          editBuffer[beforeCursor] := SPACE; INC(beforeCursor);
+          INC(currentCol); INC(index)
+        END;
+      END;
+      IF currentRow < lastRow THEN
+        Terminal.InsertLine;
+        scrollUpRowsLengths(currentRow);
+        RefreshFullLine
+      ELSE RefreshEndOfScreen
+      END;
+      RETURN
+    END;
+  ELSIF code < 0800H THEN
+    charLength := 2;
+    editBuffer[beforeCursor+0] := CHR(code DIV 64 + 0C0H);
+    editBuffer[beforeCursor+1] := CHR(code MOD 64 + 080H);
+  ELSE
+    charLength := 3;
+    editBuffer[beforeCursor+0] := CHR(code DIV 4096 + 0E0H);
+    editBuffer[beforeCursor+1] := CHR(code DIV 64 MOD 64 + 080H);
+    editBuffer[beforeCursor+2] := CHR(code MOD 64 + 080H);
+  END;
+
+  (* overwrite mode eats the next char, except when at the end of a line... *)
+  IF (NOT insertMode) AND (editBuffer[afterCursor] # LF) THEN
+    afterCursor := afterCursor + charSize(afterCursor);
+  END;
+
+  (* store the char also just before afterCursor in order to display it along with the end of line *)
+  index := afterCursor - charLength;
+  SYSTEM.COPY(bufferAddr + beforeCursor, bufferAddr + index, charLength);
+  beforeCursor := beforeCursor + charLength;
+  RefreshEndOfLine(index, currentCol, currentRow);
+  INC(currentCol);
+END insertChar;
+
+PROCEDURE cursorLeft*;
+BEGIN
+  IF beforeCursor <= editStart THEN RETURN END;
+  IF currentCol = 0 THEN
+    MoveBytesBeforeCursorToAfter(1);
+    DEC(currentFileLine);
+    UpdateColumn;
+    DEC(currentRow);
+  ELSE
+    REPEAT  (* UTF8 variable-sized chars *)
+      MoveBytesBeforeCursorToAfter(1)
+    UNTIL (ORD(editBuffer[afterCursor]) < 080H) OR (ORD(editBuffer[afterCursor]) >= 0C0H);
+    IF editBuffer[beforeCursor] = TAB THEN UpdateColumn ELSE DEC(currentCol) END;
+  END;
+END cursorLeft;
+
+PROCEDURE selectLeft*;
+BEGIN
+  IF selectionEnd # beforeCursor THEN selectionStart := beforeCursor END;
+  cursorLeft;
+  selectionEnd  := beforeCursor;
+  RefreshFullLine
+END selectLeft;
+
+PROCEDURE cursorRight*;
+BEGIN
+  IF editBuffer[afterCursor] = LF THEN
+    IF afterCursor # editEnd THEN
+      MoveBytesAfterCursorToBefore(1);
+      INC(currentFileLine);
+      INC(currentRow);
+      currentCol := 0;
+    END;
+  ELSE
+    INC(currentCol);
+    (* UTF8 variable-sized chars *)
+    MoveBytesAfterCursorToBefore(charSize(afterCursor));
+  END;
+END cursorRight;
+
+PROCEDURE selectRight*;
+BEGIN
+  IF selectionEnd # beforeCursor THEN selectionStart := beforeCursor END;
+  cursorRight;
+  selectionEnd  := beforeCursor;
+  RefreshFullLine
+END selectRight;
+
+PROCEDURE startOfLine*;
+BEGIN WHILE currentCol # 0 DO cursorLeft END
+END startOfLine;
+
+PROCEDURE endOfLine*;
+BEGIN WHILE editBuffer[afterCursor] # LF DO cursorRight END
+END endOfLine;
+
+PROCEDURE deleteLeftCharCommand*;
+BEGIN
+  IF beforeCursor # editStart THEN cursorLeft; pendingDeleteChar := TRUE END
+END deleteLeftCharCommand;
+
+PROCEDURE deleteRightChar*;
+BEGIN
+  pendingDeleteChar := FALSE;
+  bufferModified    := TRUE;
+  IF selectionStart = afterCursor THEN INC(selectionStart) END;
+  afterCursor := afterCursor + charSize(afterCursor);
+  IF selectionEnd = afterCursor THEN selectionEnd := beforeCursor END;
+END deleteRightChar;
+
+PROCEDURE deleteLineReturn*;
+VAR index, row : INTEGER;
+BEGIN
+  deleteRightChar;
+  IF currentRow < lastRow - 1 THEN
+    RefreshEndOfLine(afterCursor, currentCol, currentRow);
+    Terminal.Ln;    (* move screen cursor to next line *)
+    Terminal.DeleteLine; (* delete next screen line so that end of screen scrolls up *)
+    scrollDownRowsLengths(currentRow + 1);
+    index := afterCursor;
+    row   := currentRow;
+    REPEAT index := findNextLine(index); INC(row) UNTIL row = lastRow;
+    RefreshEndOfLine(index, 0, lastRow);
+  ELSE
+    RefreshEndOfScreen
+  END
+END deleteLineReturn;
+
+PROCEDURE deleteRightCharCommand*;
+BEGIN
+  IF afterCursor # editEnd THEN
+    IF editBuffer[afterCursor] = LF
+    THEN deleteLineReturn
+    ELSE deleteRightChar; RefreshEndOfLine(afterCursor, currentCol, currentRow)
+    END
+  END
+END deleteRightCharCommand;
+
+PROCEDURE wordLeft*;
+VAR type, wordType : INTEGER;
+BEGIN
+  WHILE charType(beforeCursor - 1) = CONTROL DO cursorLeft END;
+  wordType := charType(beforeCursor - 1);
+  REPEAT
+    cursorLeft;
+    type := charType(beforeCursor - 1);
+  UNTIL (type # wordType) OR (type = CRLF);
+END wordLeft;
+
+PROCEDURE wordRight*;
+VAR type, wordType : INTEGER;
+BEGIN
+  wordType := charType(afterCursor);
+  REPEAT
+    cursorRight;
+    type := charType(afterCursor);
+  UNTIL (type # wordType) OR (type = CRLF);
+  WHILE charType(afterCursor) = CONTROL DO cursorRight END;
+END wordRight;
+
+PROCEDURE deleteRightWord*;
+VAR type : INTEGER;
+BEGIN
+  type := charType(afterCursor);
+  IF type = CRLF THEN deleteLineReturn; RETURN END;
+  REPEAT deleteRightChar UNTIL charType(afterCursor) # type;
+  WHILE charType(afterCursor) = CONTROL DO deleteRightChar END;
+  RefreshEndOfLine(afterCursor, currentCol, currentRow);
+END deleteRightWord;
+
+(* added for UTF8 *)
+PROCEDURE reachCurrentColumn(index: INTEGER): INTEGER;
+VAR oldColumn, column : INTEGER;
+BEGIN
+  oldColumn  := currentCol;
+  currentCol := 0;
+  WHILE (currentCol # oldColumn) AND (editBuffer[index] # LF) DO
+    index := index + charSize(index);
+    INC(currentCol);
+  END;
+  RETURN index
+END reachCurrentColumn;
+
+PROCEDURE lineUp*;
+VAR index, oldColumn, column : INTEGER;
+BEGIN
+  index := findStartOfLine(beforeCursor - 1); (* start of current line *)
+  IF index > editStart THEN
+    index := findStartOfLine(index - 2);
+    index := reachCurrentColumn(index);
+    MoveBytesBeforeCursorToAfter(beforeCursor - index);
+    DEC(currentFileLine);
+    DEC(currentRow);
+  END
+END lineUp;
+
+PROCEDURE selectUp*;
+VAR adjust: BOOLEAN;
+    startOfLine: INTEGER;
+BEGIN
+  adjust      := selectionEnd = beforeCursor;
+  startOfLine := findStartOfLine(beforeCursor-1);
+  IF adjust
+  THEN selectionEnd   := startOfLine
+  ELSE selectionStart := startOfLine; selectionEnd := beforeCursor
+  END;
+  RefreshFullLine;
+  lineUp;
+  IF adjust
+  THEN selectionEnd   := beforeCursor
+  ELSE selectionStart := beforeCursor
+  END;
+  RefreshFullLine
+END selectUp;
+
+PROCEDURE lineDown*;
+VAR index: INTEGER;
+BEGIN
+  index := findNextLine(afterCursor);
+  IF index <= editEnd THEN
+    index := reachCurrentColumn(index);
+    MoveBytesAfterCursorToBefore(index - afterCursor);
+    INC(currentFileLine);
+    INC(currentRow);
+  END
+END lineDown;
+
+PROCEDURE selectDown*;
+VAR oldStart: INTEGER;
+BEGIN
+  IF selectionEnd # beforeCursor THEN selectionStart := beforeCursor END;
+  selectionEnd := findNextLine(afterCursor);
+  RefreshFullLine;
+  lineDown;
+  selectionEnd   := beforeCursor;
+  RefreshFullLine
+END selectDown;
+
+PROCEDURE scrollDown;
+VAR index, row : INTEGER;
+BEGIN
+  Terminal.GotoXY(0,1);
+  Terminal.DeleteLine;
+  scrollDownRowsLengths(1);
+  index := afterCursor;
+  FOR row := currentRow TO lastRow-1 DO index := findNextLine(index) END;
+  RefreshEndOfLine(index, 0, lastRow)
+END scrollDown;
+
+PROCEDURE windowDown*;
+BEGIN
+  IF currentRow <= 1 THEN lineDown END;
+  DEC(currentRow);
+  scrollDown
+END windowDown;
+
+PROCEDURE scrollUp;
+VAR index, row : INTEGER;
+BEGIN
+  Terminal.GotoXY(0,1);
+  Terminal.InsertLine;
+  scrollUpRowsLengths(1);
+  IF currentRow = 1 THEN RefreshFullLine
+  ELSE
+    row   := currentRow;
+    index := findStartOfLine(beforeCursor);
+    REPEAT
+      index := findStartOfLine(index - 2);
+      DEC(row);
+    UNTIL row = 1;
+    RefreshEndOfLine(index, 0, 1)
+  END;
+END scrollUp;
+
+PROCEDURE windowUp*;
+BEGIN
+  IF currentRow >= lastRow - 1 THEN lineUp END;
+  INC(currentRow);
+  scrollUp
+END windowUp;
+
+PROCEDURE toTopOfFile*;
+BEGIN
+  MoveBytesBeforeCursorToAfter(beforeCursor - editStart);
+  UpdateColumn;
+  currentRow      := 1;
+  currentFileLine := 1;
+  screenRefreshed := FALSE
+END toTopOfFile;
+
+PROCEDURE toEndOfFile*;
+BEGIN
+  currentFileLine := currentFileLine + NbOfLinesBetween(afterCursor, editEnd);
+  MoveBytesAfterCursorToBefore(editEnd - afterCursor);
+  IF currentFileLine < lastRow
+  THEN currentRow := currentFileLine
+  ELSE currentRow := lastRow - 1
+  END;
+  UpdateColumn;
+  RefreshScreen
+END toEndOfFile;
+
+PROCEDURE goTo*(index: INTEGER);
+BEGIN
+  IF    index > afterCursor  THEN MoveBytesAfterCursorToBefore(index - afterCursor)
+  ELSIF index < beforeCursor THEN MoveBytesBeforeCursorToAfter(beforeCursor - index)
+  END;
+  currentFileLine := NbOfLinesBetween(editStart, beforeCursor) + 1;
+  UpdateColumn;
+  RefreshScreen
+END goTo;
+
+PROCEDURE goToLine*(line: INTEGER);
+VAR index: INTEGER;
+BEGIN
+  IF    line < currentFileLine THEN toTopOfFile
+  ELSIF line = currentFileLine THEN
+    index := findStartOfLine(beforeCursor-1);
+    MoveBytesBeforeCursorToAfter(beforeCursor - index)
+  END;
+  index := afterCursor;
+  WHILE (index < editEnd) & (currentFileLine < line) DO
+    index := findNextLine(index);
+    IF index < editEnd THEN INC(currentFileLine) ELSE index := editEnd END
+  END;
+  MoveBytesAfterCursorToBefore(index - afterCursor);
+  screenRefreshed := FALSE;
+END goToLine;
+
+PROCEDURE goToLineColumn*(line, column: INTEGER);
+VAR index: INTEGER;
+    msg: ARRAY 64 OF CHAR;
+BEGIN
+  IF line # 0 THEN
+    goToLine(line);
+    currentCol := column;
+    index      := reachCurrentColumn(afterCursor);
+    MoveBytesAfterCursorToBefore(index - afterCursor);
+    IF currentFileLine < lastRow - 6
+    THEN currentRow := currentFileLine
+    ELSE currentRow := lastRow - 6
+    END;
+    RefreshScreen;
+    dontRefreshStatus := TRUE
+  END
+END goToLineColumn;
+
+PROCEDURE deleteLine*;
+BEGIN
+  WHILE currentCol # 0 DO cursorLeft END;
+  WHILE editBuffer[afterCursor] # LF DO deleteRightChar END;
+  RefreshEndOfLine(afterCursor, 0, currentRow);
+  currentCol := 0;
+  deleteLineReturn
+END deleteLine;
+
+PROCEDURE pageUp*;
+VAR i,row: INTEGER;
+BEGIN
+  row := currentRow;
+  FOR i := 6 TO lastRow DO lineUp END;
+  IF currentFileLine < lastRow
+  THEN currentRow := currentFileLine
+  ELSE currentRow := row
+  END;
+  RefreshScreen
+END pageUp;
+
+PROCEDURE pageDown*;
+VAR i,row : INTEGER;
+BEGIN
+  row := currentRow;
+  FOR i := 6 TO lastRow DO lineDown END;
+  IF (beforeCursor >= editEnd) AND (currentFileLine >= lastRow)
+  THEN currentRow := lastRow - 1
+  ELSE currentRow := row
+  END;
+  RefreshScreen
+END pageDown;
+
+PROCEDURE adjustView*;
+VAR endOfLine: INTEGER;
+BEGIN
+  IF NOT pendingDeleteChar THEN
+
+    (* strip whitespace at end of line *)
+    endOfLine := findNextLine(afterCursor) - 2;
+    WHILE (endOfLine >= afterCursor)
+      AND ((editBuffer[endOfLine] = SPACE) OR (editBuffer[endOfLine] = TAB))
+    DO
+      SYSTEM.COPY(bufferAddr+afterCursor, bufferAddr+afterCursor+1, endOfLine - afterCursor);
+      IF selectionStart = afterCursor THEN INC(selectionStart) END;
+      INC(afterCursor);
+      IF selectionEnd = afterCursor THEN selectionEnd := beforeCursor END;
+    END
+
+  END;
+
+  IF currentRow < 1 THEN
+    IF currentRow = 0
+    THEN currentRow := 1; scrollUp
+    ELSE currentRow := 1; RefreshScreen
+    END
+  ELSIF currentRow >= lastRow THEN
+    IF currentRow = lastRow
+    THEN currentRow := lastRow - 1; scrollDown
+    ELSE currentRow := lastRow - 1; RefreshScreen
+    END
+  END;
+
+  IF    NOT    screenRefreshed THEN RefreshScreen
+  ELSIF NOT endScreenRefreshed THEN RefreshEndOfScreen
+  END;
+
+  IF NOT dontRefreshStatus AND NOT KeyAvailable() THEN buildStatusLine END;
+  dontRefreshStatus := FALSE;
+
+  IF currentCol > lastColumn
+  THEN Terminal.GotoXY(lastColumn, currentRow)
+  ELSE Terminal.GotoXY(currentCol, currentRow)
+  END
+
+END adjustView;
+
+PROCEDURE toggleInsert*;
+BEGIN insertMode := NOT insertMode
+END toggleInsert;
+
+PROCEDURE toggleIndent*;
+BEGIN autoIndent := NOT autoIndent
+END toggleIndent;
+
+PROCEDURE showControlChar*(char: CHAR);
+BEGIN
+  Terminal.Highlight;
+  Terminal.GotoXY(0,0);
+  Terminal.Char('^');
+  Terminal.Char(char);
+  Terminal.Normal;
+END showControlChar;
+
+PROCEDURE saveSelection;
+VAR clipFile: Files.File;
+    rider   : Files.Rider;
+    result  : INTEGER;
+    selectionSize : INTEGER;
+    adr     : INTEGER;
+BEGIN
+  goTo(selectionStart); selectionSize := selectionEnd - afterCursor;
+  clipFile := Files.New("CLIPFILE.TXT");
+  Files.Set(rider, clipFile, LONG(0));
+  adr := bufferAddr + afterCursor;
+  WHILE selectionSize >= 512 DO
+    SYSTEM.COPY(adr, SYSTEM.ADR(clipBuffer), 512);
+    Files.WriteBytes(rider, clipBuffer, 512);
+    DEC(selectionSize, 512);
+    INC(adr, 512);
+  END;
+  IF selectionSize > 0 THEN
+    SYSTEM.COPY(adr, SYSTEM.ADR(clipBuffer), selectionSize);
+    Files.WriteBytes(rider, clipBuffer, selectionSize)
+  END;
+  Files.Register(clipFile);
+  Files.Close   (clipFile)
+END saveSelection;
+
+PROCEDURE selectCopy*;
+BEGIN
+  saveSelection;
+  selectionStart := 0;
+  selectionEnd   := 0;
+  RefreshScreen
+END selectCopy;
+
+PROCEDURE selectCut*;
+BEGIN
+  saveSelection;
+  afterCursor    := selectionEnd;
+  bufferModified := TRUE;
+  selectionStart := 0;
+  selectionEnd   := 0;
+  IF currentRow > currentFileLine THEN currentRow := currentFileLine END;
+  RefreshScreen
+END selectCut;
+
+PROCEDURE selectPaste*;
+VAR clipFile: Files.File;
+    rider   : Files.Rider;
+    clipSize, bytesToRead, adr: INTEGER;
+BEGIN
+  clipFile := Files.Old("CLIPFILE.TXT");
+  IF clipFile # NIL THEN
+    IF Files.Length(clipFile) > LONG(MAXSIZE)
+    THEN clipSize := MAXSIZE
+    ELSE clipSize := INT(Files.Length(clipFile))
+    END;
+    Files.Set(rider, clipFile, LONG(0));
+    IF clipSize+6 < afterCursor-beforeCursor THEN
+      adr := bufferAddr + beforeCursor;
+      bytesToRead := clipSize;
+      WHILE bytesToRead >= 512 DO
+        Files.ReadBytes(rider, clipBuffer, 512);
+        SYSTEM.COPY(SYSTEM.ADR(clipBuffer), adr, 512);
+        INC(adr, 512);
+        DEC(bytesToRead, 512);
+      END;
+      IF bytesToRead > 0 THEN
+        Files.ReadBytes(rider, clipBuffer, bytesToRead);
+        SYSTEM.COPY(SYSTEM.ADR(clipBuffer), adr, bytesToRead);
+      END;
+      bufferModified := TRUE;
+      beforeCursor   := beforeCursor + clipSize;
+      MoveBytesBeforeCursorToAfter(clipSize);
+      RefreshScreen
+    ELSE
+      PrintOnStatusLine("NOT ENOUGH SPACE", 0)
+    END;
+    Files.Close(clipFile)
+  END
+END selectPaste;
+
+PROCEDURE FindString*(str: ARRAY OF CHAR);
+VAR index, i: INTEGER;
+    firstChar: CHAR;
+    found : BOOLEAN;
+BEGIN
+  firstChar := str[0];
+  index := afterCursor;
+  REPEAT
+    index := FindForward(index + 1, firstChar);
+    i := 1; WHILE (i < LEN(str)) AND (editBuffer[index+i] = str[i]) DO INC(i) END;
+  UNTIL (i = LEN(str)) OR (str[i] = 0X);
+  MoveBytesAfterCursorToBefore(index - afterCursor);
+END FindString;
+
+PROCEDURE ReplaceString*(str1, str2: ARRAY OF CHAR);
+BEGIN
+END ReplaceString;
+
+PROCEDURE LoadFile*(): BOOLEAN;
+VAR editFile: Files.File;
+    rider   : Files.Rider;
+    fileSize: INTEGER;
+    success : BOOLEAN;
+BEGIN
+  editFile := Files.Old(fileName);
+  IF Files.Length(editFile) < LONG(editEnd) THEN
+    fileSize := INT(Files.Length(editFile));
+    Files.Set      (rider, editFile, LONG(0));
+    Files.ReadBytes(rider, SYSTEM.VAL(BUFFER, editBuffer), fileSize);
+    success := rider.res = 0;
+    IF success THEN
+      beforeCursor      := fileSize;            (* cursor at the end of the initial buffer contents *)
+      afterCursor       := editEnd;
+      MoveBytesBeforeCursorToAfter(fileSize);
+    ELSE
+      Terminal.String("Error reading file, aborting.");
+      Terminal.Ln;
+    END;
+  ELSE
+    success := FALSE;
+    Terminal.String("File is too big, aborting.");
+    Terminal.Ln;
+  END;
+  Files.Close(editFile);
+  RETURN success
+END LoadFile;
+
+PROCEDURE SaveFile*;
+VAR backupName: ARRAY 20 OF CHAR;
+    result    : INTEGER;
+    editFile  : Files.File;
+    rider     : Files.Rider;
+BEGIN
+  MoveBytesAfterCursorToBefore(editEnd - afterCursor);
+  editFile := Files.New(fileName);
+  Files.Set       (rider, editFile, LONG(0));
+  Files.WriteBytes(rider, SYSTEM.VAL(BUFFER, editBuffer), beforeCursor);
+  Files.Register  (editFile);
+  Files.Close     (editFile);
+END SaveFile;
+
+(* CAUTION: the address of the provided buffer will be memorized for all future uses ! *)
+PROCEDURE Init*(bufAddr: ADDRESS;        (* buffer that will be used for editing *)
+                bufLen : INTEGER;        (* size of buffer *)
+                name   : ARRAY OF CHAR;  (* name that will be displayed in status line *)
+                indent : BOOLEAN;        (* autoIndent mode *)
+                insert : BOOLEAN);       (* insert/overwrite mode *)
+VAR i: INTEGER;
+BEGIN
+  lastRow           := Terminal.numRows - 1;
+  lastColumn        := Terminal.numCols - 1;
+  autoIndent        := indent;
+  insertMode        := insert;
+  fileName          := name;
+  fileNameLength    := Strings.Length(name);
+  pendingDeleteChar := FALSE;
+  screenRefreshed   := FALSE;
+  bufferModified    := FALSE;
+  editStart         := 0;
+  editEnd           := bufLen;
+  beforeCursor      := 0;
+   afterCursor      := bufLen;
+  selectionEnd      := 0;
+  selectionStart    := 0;
+  bufferAddr        := bufAddr;
+  (* CAUTION: we make the global array reference the provided buffer !! *)
+  SYSTEM.COPY(SYSTEM.ADR(bufferAddr), SYSTEM.ADR(bufferAddr)+2, 2); (* changes editBuffer reference! *)
+
+  currentFileLine   := 1;
+  currentRow        := 1;
+  currentCol        := 0;
+END Init;
+
+END EditView.

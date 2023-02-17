@@ -1,0 +1,37 @@
+?       ; Delete left char. : BackSp      0x7f
+[[3~    ; Delete right char.: Del
+[[D     ; Cursor left       : ←
+[[C     ; Cursor right      : →
+[[3;5~  ; Delete right word : Ctrl Del    ESC [3;5~
+[[1;5D  ; Word left         : Ctrl ←      ESC [1;5D
+[[1;5C  ; Word right        : Ctrl →      ESC [1;5C
+Y       ; Delete line       : Ctrl Y
+[[A     ; Line up           : ↑           ESC [A
+[[B     ; Line down         : ↓           ESC [B
+[[1;5A  ; Scroll down       : Ctrl ↑      ESC [1;5A
+[[1;5B  ; Scroll up         : Ctrl ↓      ESC [1;5B
+[[5~    ; Page up           : ⇞ (PgUp)    ESC [5~
+[[6~    ; Page down         : ⇟ (PgDn)    ESC [6~
+[[1~    ; To left of line   : ↖ (Home)    ESC [1~
+[[H     ;    alternate key  :             ESC [H
+[[4~    ; To right of line  : End         ESC [4~
+[[F     ;    alternate key  :             ESC [F
+[[1;5H  ; To top of file    : Ctrl ↖      ESC [1;5H
+[[1;5F  ; To end of file    : Ctrl End    ESC [1;5F
+[[20~   ; Quit, no save     : F9          ESC [20~
+S       ; Save, edit        : Ctrl S
+[[21~   ; Save file, exit   : F10         ESC [21~
+[[2~    ; Insert mode on/off: Ins         ESC [2~
+[[15~   ; Compile           : F5
+[[17~   ; Goto next errror  : F6
+[[Z     ; Auto-indent on/off: F8
+I       ; Tab               : Tab
+U       ; Unicode hex entry : Ctrl U   (replaces original Control Prefix Char (Ctrl P))
+[[1;2D  ; Select left       : Shift ←
+[[1;2C  ; Select right      : Shift →
+[[1;2A  ; Select up         : Shift ↑
+[[1;2B  ; Select down       : Shift ↓
+X       ; Selection delete  : Ctrl X
+C       ; Selection copy    : Ctrl C
+V       ; Selection paste   : Ctrl V
+

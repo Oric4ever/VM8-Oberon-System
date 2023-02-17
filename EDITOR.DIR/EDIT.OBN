@@ -1,0 +1,268 @@
+MODULE Edit;
+IMPORT SYSTEM, DIR32, Terminal, Files, Streams, Scan, EditView, ComLine, Out;
+
+CONST CTRLC = 03X; TAB = 09X; LF = 0AX; CR = 0DX; ESC = 1BX; SPACE = 20X; DEL = 7FX;
+      MAXSIZE = 32500;
+      (* CharType : *)
+      CRLF = 0; CONTROL = 1; OTHER = 2; ALPHANUM = 3;
+      NBCOMMANDS = 36;
+(* $X+ *)
+(* $T- *)
+
+VAR
+
+buffer           : ARRAY MAXSIZE+200 OF CHAR;
+exitFlag         : BOOLEAN;
+key              : CHAR;
+fileName         : ComLine.FileName;
+editKeys         : ARRAY NBCOMMANDS+1,8 OF CHAR;
+fileIsNew        : BOOLEAN;
+errorFilePresent : BOOLEAN;
+errorFile        : Streams.InputStream;
+
+PROCEDURE goToNextError;
+VAR i, line, column: INTEGER;
+    index : INTEGER;
+    msg: ARRAY 64 OF CHAR;
+BEGIN
+  IF errorFilePresent AND NOT Streams.End(errorFile) THEN
+    line := 0;
+    Scan.String(errorFile, msg, SPACE);
+    IF msg # "line" THEN RETURN END;
+    Scan.Int   (errorFile, line);
+    Scan.String(errorFile, msg, SPACE); (* should be "col" *)
+    Scan.Int   (errorFile, column);
+    Scan.String(errorFile, msg, LF);
+    IF line # 0 THEN
+      EditView.goToLineColumn(line, column-1);
+      EditView.PrintOnStatusLine(msg, 0);
+      Terminal.ClearToEOL
+    END
+  END
+END goToNextError;
+
+PROCEDURE addExtension(VAR name: ARRAY OF CHAR; ext: ARRAY OF CHAR; forceExt: BOOLEAN);
+VAR i : INTEGER;
+BEGIN
+  i := 0; REPEAT INC(i) UNTIL (i = 8) OR (name[i]='.') OR (name[i]=0X);
+  IF forceExt OR (name[i] # '.') THEN
+    name[i]   := '.';
+    name[i+1] := ext[0];
+    name[i+2] := ext[1];
+    name[i+3] := ext[2];
+    IF i+4 < LEN(name) THEN name[i+4] := 0X END;
+  END;
+END addExtension;
+
+PROCEDURE KeyAvailable(): BOOLEAN;
+BEGIN RETURN Terminal.HasKey()
+END KeyAvailable;
+
+PROCEDURE GetKey(): CHAR;
+BEGIN RETURN Terminal.Get()
+END GetKey;
+
+PROCEDURE Confirm(msg: ARRAY OF CHAR): BOOLEAN;
+VAR ch: CHAR;
+BEGIN
+  EditView.PrintOnStatusLine(msg, 0);
+  Terminal.String("? (Y/N) ");
+  Terminal.ClearToEOL;
+  ch := CAP(GetKey());
+  Terminal.Char(ch);
+  Terminal.Normal;
+  RETURN ch = 'Y'
+END Confirm;
+
+PROCEDURE SaveFile;
+VAR backupName: ComLine.FileName;
+    result: INTEGER;
+BEGIN
+  IF NOT fileIsNew THEN
+    backupName := fileName;
+    addExtension(backupName, "BAK", TRUE);
+    Files.Delete(backupName, result);
+    Files.Rename(fileName, backupName, result);
+  END;
+  EditView.SaveFile
+END SaveFile;
+
+PROCEDURE GetCommandIndex(char: CHAR):INTEGER;
+VAR sequence : ARRAY 10 OF CHAR;
+    n, size: INTEGER;
+    showSeq: BOOLEAN;
+  PROCEDURE IsSubSequence(seq: ARRAY OF CHAR): BOOLEAN;
+    VAR i, n: INTEGER;
+  BEGIN
+    FOR n := 1 TO NBCOMMANDS DO
+      IF seq[0] = editKeys[n][0] THEN
+        i := 1; WHILE (seq[i] # 0X) & (seq[i] = editKeys[n][i]) DO INC(i) END;
+        IF seq[i] = 0X THEN RETURN TRUE END
+      END
+    END;
+    RETURN FALSE
+  END IsSubSequence;
+BEGIN
+  IF char < SPACE
+  THEN char := CHR(ORD(char)+64)
+  ELSE char := CHR(ORD(char)-64)
+  END;
+  sequence[0] := char;
+  sequence[1] := 0X;
+  size        := 1;
+  FOR n:=1 TO NBCOMMANDS DO
+    IF sequence = editKeys[n] THEN RETURN n END
+  END;
+  showSeq := char # ESC;
+  IF showSeq THEN (* show first (control) char of sequence *)
+    Terminal.GotoXY(0,0);
+    Terminal.Highlight;
+    Terminal.Char('^');
+    Terminal.Normal;
+  END;
+  WHILE IsSubSequence(sequence) DO
+    IF showSeq THEN Terminal.Highlight; Terminal.Char(char); Terminal.Normal END;
+    char := GetKey(); IF size <= 2 THEN char := CAP(char) END;
+    sequence[size] := char; INC(size); sequence[size] := 0X;
+    FOR n:=1 TO NBCOMMANDS DO
+      IF sequence = editKeys[n] THEN RETURN n END
+    END;
+  END;
+  RETURN 0
+END GetCommandIndex;
+
+PROCEDURE editMenu;
+VAR key: CHAR;
+    code, commandNum, row, targetRow, length : INTEGER;
+BEGIN
+  IF EditView.pendingDeleteChar THEN EditView.deleteRightCharCommand; RETURN END;
+  key := GetKey();
+  IF ORD(key) >= 0C0H THEN (* UTF8 encoded char *)
+    code := ORD(key) MOD 32 * 64 + ORD(GetKey()) MOD 64;
+    IF ORD(key) >= 0E0H
+    THEN EditView.insertChar(code * 64 + ORD(GetKey()) MOD 64)
+    ELSE EditView.insertChar(code)
+    END;
+  ELSIF (key >= SPACE) AND (key < DEL) OR (key = CR) THEN EditView.insertChar(ORD(key))
+  ELSE
+    commandNum := GetCommandIndex(key);
+    CASE commandNum OF
+    |  1 : EditView.deleteLeftCharCommand
+    |  2 : EditView.deleteRightCharCommand
+    |  3 : EditView.cursorLeft
+    |  4 : EditView.cursorRight
+    |  5 : EditView.deleteRightWord
+    |  6 : EditView.  wordLeft
+    |  7 : EditView.  wordRight
+    |  8 : EditView.deleteLine
+    |  9 : EditView.  lineUp
+    | 10 : EditView.  lineDown
+    | 11 : EditView.windowDown
+    | 12 : EditView.windowUp
+    | 13 : EditView.  pageUp
+    | 14 : EditView.  pageDown
+    | 15 : EditView. startOfLine
+    | 16 : EditView. startOfLine
+    | 17 : EditView.   endOfLine
+    | 18 : EditView.   endOfLine
+    | 19 : EditView. toTopOfFile
+    | 20 : EditView. toEndOfFile
+    | 21 : (* Abandon edit   *) IF NOT EditView.bufferModified OR Confirm("ABANDON EDITED FILE ") THEN
+                                  (* EditDisk.proc5; *)
+                                  exitFlag := TRUE;
+                                END
+    | 22 : (* save file      *) SaveFile (* TODO: restore cursor position *)
+    | 23 : (* save and exit  *) SaveFile; exitFlag := TRUE
+    | 24 : EditView.toggleInsert
+    | 25 : (* compile *) SaveFile; exitFlag := TRUE; ComLine.Chain("OBN",ComLine.arg1,"","","")
+    | 26 : (* goto next error*) goToNextError
+    | 27 : EditView.toggleIndent
+    | 28 : (* tab            *) REPEAT EditView.insertChar(ORD(SPACE)) UNTIL EditView.currentCol MOD 4 = 0
+    | 29 : (* unicode entry  *) EditView.showControlChar('U');
+           code := 0;
+           FOR length := 1 TO 4 DO
+             key := CAP(GetKey());
+             IF    (key >= '0') AND (key <= '9') THEN code := code * 16 + (ORD(key)-ORD('0'))
+             ELSIF (key >= 'A') AND (key <= 'Z') THEN code := code * 16 + (ORD(key)-ORD('A'))+10
+             END;
+           END;
+           EditView.insertChar(code)
+    | 30 : EditView.selectLeft
+    | 31 : EditView.selectRight
+    | 32 : EditView.selectUp
+    | 33 : EditView.selectDown
+    | 34 : EditView.selectCut
+    | 35 : EditView.selectCopy
+    | 36 : EditView.selectPaste
+    END
+  END
+END editMenu;
+
+PROCEDURE EditorMainLoop;
+VAR endOfLine: INTEGER;
+    local3 : INTEGER;
+BEGIN
+  goToNextError;
+  REPEAT
+    EditView.adjustView;
+    editMenu;
+  UNTIL exitFlag
+END EditorMainLoop;
+
+PROCEDURE InitEditor*(fileName: ARRAY OF CHAR): BOOLEAN;
+VAR fileSize, i : INTEGER;
+    errorName   : ARRAY 12 OF CHAR;
+    editFile    : Files.File;
+BEGIN
+  errorName := fileName; addExtension(errorName, "ERR", TRUE);
+  errorFile := Streams.Input(errorName);
+  errorFilePresent := (errorFile # NIL);
+
+  FOR i := 1 TO 100 DO
+    buffer[i-1] := LF;
+    buffer[LEN(buffer)-i] := LF
+  END;
+  EditView.Init(SYSTEM.ADR(buffer)+100, LEN(buffer)-200, fileName, TRUE, TRUE);
+  editFile  := Files.Old(fileName);
+  fileIsNew := (editFile = NIL);
+  IF NOT fileIsNew THEN Files.Close(editFile) END;
+  RETURN fileIsNew OR EditView.LoadFile()
+END InitEditor;
+
+(* $T+ be sure to code assertions *)
+
+PROCEDURE ReadKeys();
+VAR i      : INTEGER;
+    keyFile: Streams.InputStream;
+    comment: ARRAY 80 OF CHAR;
+BEGIN
+  DIR32.SaveCurrentDir;
+  DIR32.EnterRootDir;
+  ASSERT( DIR32.EnterDir("EDITOR") );
+  keyFile := Streams.Input("EDITKEYS.TXT");
+  ASSERT( keyFile # NIL );
+  FOR i:=1 TO NBCOMMANDS DO
+    Scan.String(keyFile, editKeys[i], SPACE);
+    Scan.Line  (keyFile, comment);
+  END;
+  Streams.Close(keyFile);
+  DIR32.BackToSavedDir;
+END ReadKeys;
+
+BEGIN
+  IF ComLine.arg1 = "" THEN Out.String("Usage: edit filename")
+  ELSE
+    ReadKeys;
+    fileName := ComLine.arg1; addExtension(fileName, "OBN", FALSE);
+    IF InitEditor(fileName) THEN
+      Terminal.ClearScreen;
+      EditView.buildStatusLine;
+      EditView.RefreshScreen;
+      EditorMainLoop;
+      Terminal.GotoXY(0, EditView.lastRow);
+    END
+  END;
+  Out.Ln;
+  Out.Ln
+END Edit.
+
