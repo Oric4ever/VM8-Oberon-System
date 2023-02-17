@@ -1,0 +1,24 @@
+MODULE Delete;
+IMPORT Terminal, Files, ComLine, FileName;
+
+VAR filename : ComLine.FileName;
+    result: INTEGER;
+BEGIN
+  IF ComLine.arg1 = "" THEN Terminal.String("Usage: delete filename");
+  ELSE
+    filename := ComLine.arg1;
+    result   := FileName.CheckName(filename);
+    CASE result OF
+    | FileName.NORMAL: Files.Delete(filename, result);
+                       IF result # 0 THEN
+                         Terminal.String(filename);
+                         Terminal.String(" not found.");
+                       END
+    | FileName.WILDCARD: Terminal.String("TODO: implement wildcards");
+    | FileName.INVALID : Terminal.String(filename);
+                         Terminal.String(" is illegal file name.");
+    END;
+  END;
+ Terminal.Ln
+END Delete.
+

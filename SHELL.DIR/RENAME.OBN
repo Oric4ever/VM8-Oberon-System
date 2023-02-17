@@ -1,0 +1,38 @@
+MODULE Rename;
+IMPORT Terminal, Files, ComLine, FileName;
+
+VAR file1, file2 : Files.File;
+    result  : INTEGER;
+
+PROCEDURE Confirm(msg: ARRAY OF CHAR): BOOLEAN;
+VAR confirm: CHAR;
+BEGIN
+  Terminal.String(msg);
+  confirm := Terminal.Get();
+  Terminal.Char(confirm);
+  Terminal.Ln;
+  RETURN CAP(confirm) = 'Y'
+END Confirm;
+
+BEGIN
+  IF FileName.CheckNames() THEN 
+    file1 := Files.Old(ComLine.arg1);
+    file2 := Files.Old(ComLine.arg2);
+    IF file1 = NIL THEN FileName.NotFound(ComLine.arg1)
+    ELSE
+      Files.Close(file1);
+      IF file2 # NIL THEN (* destination exists *)
+        Files.Close(file2);
+        Terminal.String(ComLine.arg2);
+        IF Confirm(" exists, overwrite (Y/N)? ") THEN
+          Files.Delete(ComLine.arg2, result);
+          Files.Rename(ComLine.arg1, ComLine.arg2, result)
+        END;
+      ELSE
+        Files.Rename(ComLine.arg1, ComLine.arg2, result)
+      END;
+    END;
+  END;
+  Terminal.Ln
+END Rename.
+

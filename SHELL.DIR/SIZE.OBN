@@ -1,0 +1,13 @@
+MODULE Size;
+IMPORT Files, ComLine, Out;
+VAR f: Files.File;
+BEGIN
+  IF ComLine.arg1 # "" THEN
+    f := Files.Old(ComLine.arg1);
+    IF f = NIL 
+    THEN Out.String(ComLine.arg1); Out.String(" not found.")
+    ELSE Out.Long(Files.Length(f), 9); Out.String(" bytes.")
+    END
+  END;
+  Out.Ln
+END Size.

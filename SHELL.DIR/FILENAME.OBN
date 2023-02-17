@@ -1,0 +1,86 @@
+MODULE FileName;
+IMPORT SYSTEM, Terminal, ComLine;
+(* $X+ *)
+
+CONST NORMAL* = 0; WILDCARD* = 1; NONAME* = 2; INVALID* = 3;
+
+PROCEDURE CheckName*(filename: ARRAY OF CHAR): INTEGER;
+VAR i: INTEGER;
+    char : CHAR;
+    extension, wildcard : BOOLEAN;
+BEGIN
+  i := 0;
+  extension := FALSE;
+  wildcard  := FALSE;
+  IF filename[0] = 0X THEN RETURN NONAME END;
+  WHILE (i < LEN(filename)) AND (filename[i] # 0X) DO
+    char := filename[i];
+    IF ((char = '.') AND extension)    (* double extension *)
+    OR (char = '[') OR (char = ']') OR (char = ',') OR ((char >= ';') AND (char <= '>'))
+    THEN RETURN INVALID END;
+
+    wildcard  := wildcard  OR (char = '*') OR (char = '?');
+    extension := extension OR (char = '.');
+    INC(i);
+  END;
+  IF wildcard THEN RETURN WILDCARD END;
+  RETURN NORMAL
+END CheckName;
+
+PROCEDURE NotFound*(name: ARRAY OF CHAR);
+BEGIN
+  Terminal.String(name);
+  Terminal.String(" not found.");
+  Terminal.Ln;
+END NotFound;
+
+PROCEDURE IllegalFileName*(name: ARRAY OF CHAR);
+BEGIN
+  Terminal.String(name);
+  Terminal.String(" is illegal file name.");
+  Terminal.Ln;
+END IllegalFileName;
+
+PROCEDURE CheckNames*(): BOOLEAN;
+VAR ok: BOOLEAN;
+BEGIN
+  ok := FALSE;
+  IF ComLine.arg2 = "" THEN
+    Terminal.String("Usage: ");
+    Terminal.String(ComLine.programName);
+    Terminal.String(" name1 name2");
+    Terminal.Ln
+  ELSIF CheckName(ComLine.arg1) # NORMAL THEN IllegalFileName(ComLine.arg1)
+  ELSIF CheckName(ComLine.arg2) # NORMAL THENIllegalFileName(ComLine.arg2)
+  ELSE ok := TRUE
+  END;
+  RETURN ok
+END CheckNames;
+
+PROCEDURE BuildStdFileName*(VAR filename: ARRAY OF CHAR; defaultExt: ARRAY OF CHAR; forceDefaultExt: BOOLEAN);
+VAR i, j, k: INTEGER;
+    char   : CHAR;
+BEGIN
+  i := 0;
+  (* skip basename *)
+  WHILE (i < 8) AND (filename[i] # 0X) AND (filename[i] # '.') DO
+    filename[i] := CAP(filename[i]);
+    INC(i);
+  END;
+  j := i;
+  (* skip chars if more than eight *)
+  WHILE (i < LEN(filename)) AND (filename[i] # '.') AND (filename[i] # 0X) DO INC(i) END;
+  (* copy extension *)
+  k := 0;
+  REPEAT
+    IF forceDefaultExt
+    THEN char := defaultExt[k]
+    ELSE char := filename[i+k]
+    END;
+    filename[j+k] := CAP(char);
+    INC(k)
+  UNTIL (k = 4) OR (char = 0X);
+  IF j+k < LEN(filename) THEN filename[j+k] := 0X END
+END BuildStdFileName;
+
+END FileName.

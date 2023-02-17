@@ -1,0 +1,6 @@
+MODULE Root;
+IMPORT Dir32;
+BEGIN
+  Dir32.EnterRootDir
+END Root.
+

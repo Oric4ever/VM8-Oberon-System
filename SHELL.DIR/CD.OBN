@@ -1,0 +1,9 @@
+MODULE CD; (* Change Directory *)
+IMPORT DIR32, ComLine, Terminal;
+BEGIN
+  IF NOT DIR32.EnterDir(ComLine.arg1) THEN
+    Terminal.String(ComLine.arg1);
+    Terminal.String(" not found");
+    Terminal.Ln
+  END
+END CD.

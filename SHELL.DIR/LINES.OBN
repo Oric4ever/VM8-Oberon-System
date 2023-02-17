@@ -1,0 +1,18 @@
+MODULE Lines;
+IMPORT ComLine, Streams, Scan, Out;
+VAR t    : Streams.InputStream;
+    lines: INTEGER;
+    line : ARRAY 256 OF CHAR;
+BEGIN
+  IF ComLine.arg1 = "" THEN Out.String("Usage: lines file")
+  ELSE
+    t := Streams.Input(ComLine.arg1);
+    IF t # NIL THEN
+      REPEAT INC(lines); Scan.Line(t,line) UNTIL Streams.End(t);
+      Out.Int(lines, 5); Out.String(" lines.")
+    ELSE
+      Out.String(ComLine.arg1); Out.String(" not found.")
+    END
+  END;
+  Out.Ln
+END Lines.

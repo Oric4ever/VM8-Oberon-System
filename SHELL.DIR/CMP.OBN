@@ -1,0 +1,49 @@
+MODULE Cmp; (* Compare Files *)
+IMPORT Files, ComLine, FileName, Out;
+
+VAR f1, f2: Files.File;
+
+(* $X+ *)
+
+PROCEDURE FileCompare;
+VAR offset: LONGINT;
+    r1, r2: Files.Rider;
+    ch1, ch2: BYTE;
+BEGIN
+  offset := LONG(0);
+  Files.Set(r1, f1, offset);
+  Files.Set(r2, f2, offset);
+  WHILE NOT r1.eof DO
+    IF r2.eof THEN
+      Out.String(ComLine.arg1);
+      Out.String(" has additional data at the end.");
+      RETURN
+    END;
+    Files.Read(r1, ch1); Files.Read(r2, ch2);
+    IF ch1 # ch2 THEN
+      Out.String("Files differ at offset ");
+      Out.Long(offset,9);
+      RETURN
+    END;
+    offset := offset + LONG(1);
+  END;
+  IF NOT r2.eof THEN
+    Out.String(ComLine.arg2);
+    Out.String(" has additional data at the end.")
+  ELSE
+    Out.String("Files are identical.")
+  END;
+END FileCompare;
+
+BEGIN
+  IF FileName.CheckNames() THEN
+    f1 := Files.Old(ComLine.arg1);
+    f2 := Files.Old(ComLine.arg2);
+    IF    f1 = NIL THEN FileName.NotFound(ComLine.arg1)
+    ELSIF f2 = NIL THEN FileName.NotFound(ComLine.arg2)
+    ELSE FileCompare
+    END
+  END;
+  Out.Ln
+END Cmp.
+

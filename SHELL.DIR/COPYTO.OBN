@@ -1,0 +1,23 @@
+MODULE CopyTo;
+IMPORT Dir32, Files, ComLine, FileName, Copy, Out;
+
+VAR srcFile: Files.File;
+
+BEGIN
+  IF ComLine.arg2 = "" THEN Out.String("Usage: copyto file dirname")
+  ELSE
+    srcFile := Files.Old(ComLine.arg1);
+    IF srcFile = NIL THEN FileName.NotFound(ComLine.arg1)
+    ELSE
+      Dir32.SaveCurrentDir;
+      IF Dir32.EnterDir(ComLine.arg2) THEN
+        Copy.CopyFile(srcFile, Files.New(ComLine.arg1))
+      ELSE
+        Out.String("Cannot found directory ");
+        Out.String(ComLine.arg2)
+      END;
+      Dir32.BackToSavedDir;
+    END
+  END;
+  Out.Ln
+END CopyTo.

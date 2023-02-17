@@ -1,0 +1,101 @@
+MODULE Dir;
+IMPORT Terminal, DIR32, ComLine, Out, SYSTEM;
+
+CONST MODule=0; MCD=1; SYM=2; BAK=3; ERR=4;
+
+TYPE Name     = DIR32.EntryNameAndType;
+     BaseName = DIR32.BaseName;
+     Extension= ARRAY 4 OF CHAR;
+
+VAR names     : ARRAY 1000 OF BaseName;
+    extensions: ARRAY 1000 OF Extension;
+    nbFiles   : INTEGER;
+    dirMask   : ARRAY 16 OF CHAR;
+    fileIndex : INTEGER;
+    baseName  : BaseName;
+    extension : Extension;
+    types     : SET;
+
+PROCEDURE GetExtension(fullname: Name; VAR extension: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+  FOR i := 0 TO 2 DO extension[i] := fullname.extension[i] END;
+  extension[3] := 0X
+END GetExtension;
+
+PROCEDURE ReadDir(filename: ARRAY OF CHAR);
+VAR entry  : DIR32.Entry;
+    dirMask: Name;
+BEGIN
+  DIR32.Build83Name(filename,dirMask);
+  DIR32.InitFind(dirMask);
+  nbFiles := 0;
+  WHILE (nbFiles <= 255) AND DIR32.FindNextMatch(entry) DO
+    IF  (entry.desc.nameAndType.baseName[0] # ".") THEN
+      INC(nbFiles);
+      names[nbFiles] := entry.desc.nameAndType.baseName;
+      GetExtension(entry.desc.nameAndType, extensions[nbFiles]);
+    END;
+  END;
+END ReadDir;
+
+PROCEDURE QuickSort(low, high: INTEGER);
+VAR i,j: INTEGER;
+    pivot, tmp: BaseName;
+    ext : Extension;
+BEGIN
+  i     := low;
+  j     := high;
+  pivot := names[(low + high) DIV 2];
+  REPEAT
+    WHILE names[i] < pivot DO INC(i) END;
+    WHILE names[j] > pivot DO DEC(j) END;
+    IF i <= j THEN
+      tmp := names[i]; names[i] := names[j]; names[j] := tmp;
+      ext := extensions[i]; extensions[i]:=extensions[j]; extensions[j]:=ext;
+      INC(i); DEC(j);
+    END;
+  UNTIL i > j;
+  IF low < j  THEN QuickSort(low, j)  END;
+  IF i < high THEN QuickSort(i, high) END;
+END QuickSort;
+
+BEGIN
+  IF ComLine.arg1 # ""
+  THEN ReadDir(ComLine.arg1)
+  ELSE ReadDir("*.*")
+  END;
+  IF nbFiles # 0 THEN
+    QuickSort(1,nbFiles);
+    fileIndex := 1;
+    REPEAT
+      baseName := names[fileIndex];
+      Out.String(baseName);
+      Out.Char  (' ');
+      (* Display unknown extensions first, and memorize known ones *)
+      types := {};
+      REPEAT
+        extension := extensions[fileIndex];
+        IF    extension = "OBN" THEN INCL(types, MODule)
+        ELSIF extension = "MCD" THEN INCL(types, MCD)
+        ELSIF extension = "SMB" THEN INCL(types, SYM)
+        ELSIF extension = "BAK" THEN INCL(types, BAK)
+        ELSIF extension = "ERR" THEN INCL(types, ERR)
+        ELSE Out.String(extension); Out.Char(' ')
+        END;
+        INC(fileIndex);
+      UNTIL (fileIndex > nbFiles) OR (names[fileIndex] # baseName);
+      (* then display memorized extensions *)
+      IF MODule IN types THEN Out.String("OBN ") END;
+      IF MCD    IN types THEN Out.String("MCD ") END;
+      IF SYM    IN types THEN Out.String("SMB ") END;
+      IF BAK    IN types THEN Out.String("BAK ") END;
+      IF ERR    IN types THEN Out.String("ERR ") END;
+      Out.Ln;
+    UNTIL (fileIndex > nbFiles);
+  ELSE
+    Out.String("No matching files.");
+    Out.Ln;
+  END;
+END Dir.
+

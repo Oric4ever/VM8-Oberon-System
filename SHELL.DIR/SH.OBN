@@ -1,0 +1,212 @@
+MODULE Sh; (* Shell *)
+IMPORT SYSTEM, Terminal, DIR32, ComLine, Files; (* Out; *)
+
+(* $X+ *)
+
+CONST NUL = 0X; CTRLC = 3X; BackSpace = 8X; TAB = 9X; LF = 0AX; CR = 0DX;
+      XOFF = 13X; CTRLX = 18X; EOT = 1AX; ESC = 1BX; SPACE = 20X; DEL = 7FX;
+      PROMPT = "#";
+
+TYPE FileName = ARRAY 16 OF CHAR;
+     FullName = ARRAY 16 OF CHAR;
+     Name     = RECORD fullname: FullName END;
+     NamePtr  = POINTER TO Name;
+
+VAR
+
+buffer      : ARRAY 80 OF CHAR;
+exit        : BOOLEAN;
+index       : INTEGER;
+command     : INTEGER;
+
+history     : Files.File;
+historyRider: Files.Rider;
+historyBuf  : ARRAY 4096 OF BYTE;
+historySize : INTEGER;
+historyPos  : INTEGER;
+
+PROCEDURE OpenHistory;
+VAR i: INTEGER;
+    startPos: LONGINT;
+BEGIN
+  DIR32.SaveCurrentDir;
+  DIR32.EnterRootDir;
+  IF DIR32.EnterDir("SHELL") THEN
+    history := Files.Old("history.txt");
+    IF history = NIL THEN
+      history := Files.New("history.txt");
+      Files.Register(history);
+    END;
+    startPos := Files.Length(history) - LONG(LEN(historyBuf));
+    IF startPos < LONG(0) THEN startPos := LONG(0) END;
+    Files.Set      (historyRider, history, startPos);
+    Files.ReadBytes(historyRider, historyBuf, LEN(historyBuf));
+    historyPos  := historyRider.res;
+  END;
+  DIR32.BackToSavedDir
+END OpenHistory;
+
+PROCEDURE StoreCommandInHistory(cmdline: ARRAY OF CHAR);
+VAR fileSize: LONGINT;
+    i: INTEGER;
+BEGIN
+  Files.Set(historyRider, history, Files.Length(history));
+  i := 0; WHILE cmdline[i] # 0X DO Files.Write(historyRider, ORD(cmdline[i])); INC(i) END;
+  Files.Write(historyRider, ORD(LF));
+END StoreCommandInHistory;
+
+PROCEDURE HistoryBack(VAR buffer: ARRAY OF CHAR; VAR index: INTEGER);
+VAR pos : INTEGER;
+    char: CHAR;
+BEGIN
+  IF historyPos >= 2 THEN
+    REPEAT DEC(historyPos) UNTIL (historyPos = 0) OR (historyBuf[historyPos-1] = ORD(LF));
+    pos   := historyPos;
+    index := 0;
+    REPEAT
+      char := CHR(historyBuf[pos]); INC(pos);
+      IF index < LEN(buffer) THEN buffer[index] := char; INC(index) END;
+    UNTIL char = LF;
+    DEC(index);
+    buffer[index] := NUL
+  END
+END HistoryBack;
+
+PROCEDURE HistoryNext(VAR buffer: ARRAY OF CHAR; VAR index: INTEGER);
+VAR pos : INTEGER;
+    char: CHAR;
+BEGIN
+  IF historyPos < historySize THEN
+    WHILE (historyPos < historySize) AND (historyBuf[historyPos] # ORD(LF)) DO INC(historyPos) END;
+    INC(historyPos);
+    pos   := historyPos;
+    index := 0;
+    WHILE (pos < historySize) AND (historyBuf[pos] # ORD(LF)) DO
+      IF index < LEN(buffer)-1 THEN buffer[index] := CHR(historyBuf[pos]); INC(index) END;
+      INC(pos)
+    END;
+    buffer[index] := 0X
+  END
+END HistoryNext;
+
+PROCEDURE RefreshLine(buffer: ARRAY OF CHAR);
+BEGIN
+  Terminal.Char  (CR);
+  Terminal.Char  (PROMPT);
+  Terminal.Char  (SPACE);
+  Terminal.String(buffer);
+  Terminal.ClearToEOL
+END RefreshLine;
+
+PROCEDURE DeleteLastChar(VAR buffer: ARRAY OF CHAR; index: INTEGER);
+BEGIN
+  buffer[index] := 0X;
+  Terminal.Char(BackSpace);
+  Terminal.Char(SPACE);
+  Terminal.Char(BackSpace);
+END DeleteLastChar;
+
+PROCEDURE ReadCmdLine(VAR buffer: ARRAY OF CHAR);
+VAR i : INTEGER;
+    char: CHAR;
+BEGIN
+  REPEAT
+    char := Terminal.Get();
+    IF char = TAB THEN char := SPACE END;
+    IF (char >= SPACE) AND (char < DEL) THEN
+      IF i < LEN(buffer)-1 THEN
+        buffer[i] := CAP(char);
+        Terminal.Char(char);
+        INC(i);
+      END;
+    ELSIF (char = BackSpace) OR (char = DEL) THEN
+      IF i # 0 THEN DeleteLastChar(buffer, i); DEC(i) END
+    ELSIF char = CTRLX THEN
+      WHILE i # 0 DO DeleteLastChar(buffer, i); DEC(i) END
+    ELSIF char = ESC THEN
+      Terminal.Char(char);
+      IF char = '[' THEN
+        REPEAT char := Terminal.Get() UNTIL char >= "A";
+        CASE char OF
+        | 'A': HistoryBack(buffer, i); RefreshLine(buffer)
+        | 'B': HistoryNext(buffer, i); RefreshLine(buffer)
+        END
+      END
+    END
+  UNTIL char = CR;
+  buffer[i] := NUL;
+  Terminal.Ln;
+END ReadCmdLine;
+
+PROCEDURE SkipWhiteSpace(buffer: ARRAY OF CHAR; VAR index: INTEGER);
+BEGIN
+  WHILE buffer[index] = SPACE DO INC(index) END
+END SkipWhiteSpace;
+
+PROCEDURE isAlphaNum(char: CHAR): BOOLEAN;
+BEGIN
+  RETURN (char >= '0') AND (char <='9') OR
+         (char >= 'A') AND (char <='Z') OR
+         (char >= 'a') AND (char <='z')
+END isAlphaNum;
+
+PROCEDURE ReadWord( alphanumOnly : BOOLEAN;
+                        buffer   : ARRAY OF CHAR;
+                    VAR bufIndex : INTEGER;
+                    VAR word     : ARRAY OF CHAR;
+                    VAR wrdIndex : INTEGER);
+VAR char: CHAR;
+BEGIN
+  char := buffer[bufIndex];
+  WHILE (char # NUL) AND (char # SPACE) DO
+    IF alphanumOnly AND NOT isAlphaNum(char) THEN
+      REPEAT INC(bufIndex); char := buffer[bufIndex] UNTIL (char = NUL) OR (char = SPACE)
+    ELSE
+      IF wrdIndex < LEN(word) THEN word[wrdIndex] := char; INC(wrdIndex) END;
+      INC(bufIndex); char := buffer[bufIndex];
+    END;
+  END;
+  IF wrdIndex < LEN(word) THEN word[wrdIndex] := NUL END
+END ReadWord;
+
+PROCEDURE RunCmdLine(buffer: ARRAY OF CHAR);
+VAR index, argsIndex, nameLen, i : INTEGER;
+    progName : ARRAY 8 OF CHAR;
+    args  : ARRAY 80 OF CHAR;
+    input, output: ARRAY 20 OF CHAR;
+BEGIN
+  index   := 0; SkipWhiteSpace(buffer, index);
+  nameLen := 0; ReadWord(TRUE, buffer, index, progName, nameLen);
+  IF nameLen = 0 THEN RETURN END;
+  StoreCommandInHistory(buffer);
+  argsIndex := 0; args[0] := NUL;
+  WHILE buffer[index] # NUL DO
+    SkipWhiteSpace(buffer, index);
+    IF    buffer[index] = '<' THEN INC(index); i:=0; ReadWord(FALSE, buffer, index, input, i)
+    ELSIF buffer[index] = '>' THEN INC(index); i:=0; ReadWord(FALSE, buffer, index, output, i)
+    ELSE
+      IF argsIndex # 0 THEN args[argsIndex] := SPACE; INC(argsIndex) END;
+      ReadWord(FALSE, buffer, index, args, argsIndex)
+    END
+  END;
+  ComLine.Chain(progName, args, input, output);
+(*
+  Terminal.String("Program: "); Terminal.String(progName); Terminal.Ln;
+  Terminal.String("Args   : "); Terminal.String(args);     Terminal.Ln;
+  Terminal.String("Input  : "); Terminal.String(input);    Terminal.Ln;
+  Terminal.String("Output : "); Terminal.String(output);   Terminal.Ln;
+*)
+  exit := TRUE;
+END RunCmdLine;
+
+BEGIN
+  OpenHistory;
+  REPEAT
+    Terminal.Char(PROMPT);
+    Terminal.Char(SPACE);
+    ReadCmdLine(buffer);
+    RunCmdLine(buffer)
+  UNTIL exit;
+  Files.Close(history)
+END Sh.
+

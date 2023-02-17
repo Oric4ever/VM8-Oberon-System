@@ -1,0 +1,33 @@
+MODULE Copy;
+IMPORT SYSTEM, Disk, Terminal, Files, ComLine, FileName, Out;
+
+TYPE Name = ComLine.FileName;
+VAR srcFile: Files.File;
+
+PROCEDURE CopyFile*(srcFile, dstFile: Files.File);
+VARbuffer: ARRAY 512 OF BYTE;
+    srcRider, dstRider: Files.Rider;
+BEGIN
+  Files.Set(srcRider, srcFile, LONG(0));
+  Files.Set(dstRider, dstFile, LONG(0));
+  Files.ReadBytes(srcRider, buffer, 512);
+  WHILE srcRider.res = 0 DO (* a full buffer has been read *)
+    Files.WriteBytes(dstRider, buffer, 512);
+    Files. ReadBytes(srcRider, buffer, 512);
+  END;
+  IF srcRider.res # 512 THEN
+    Files.WriteBytes(dstRider, buffer, 512-srcRider.res)
+  END;
+  Files.Register(dstFile);
+  Files.Close   (dstFile);
+END CopyFile;
+
+BEGIN
+  IF FileName.CheckNames() THEN
+    srcFile := Files.Old(ComLine.arg1);
+    IF srcFile = NIL THEN FileName.NotFound(ComLine.arg1)
+    ELSE CopyFile(srcFile, Files.New(ComLine.arg2))
+    END
+  END
+END Copy.
+

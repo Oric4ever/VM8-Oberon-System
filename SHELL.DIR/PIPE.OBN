@@ -1,0 +1,11 @@
+MODULE Pipe; (* pipe input to output *)
+IMPORT In, Out;
+
+VAR ch : CHAR;
+BEGIN
+  WHILE NOT In.End() DO
+    In .Char(ch);
+    Out.Char(ch)
+  END;
+  Out.Close
+END Pipe.
