@@ -1,0 +1,552 @@
+MODULE Oberon; (*N. Wirth 1.7.97 / 8.3.2020  Oberon compiler *)
+  IMPORT SYSTEM, ComLine, Out, Token, Scanner, Symbols, Gen := Gen2, Expressions, Statements;
+  (*Author: Niklaus Wirth, 2014.
+    Parser of Oberon compiler. Uses Scanner to obtain symbols (tokens),
+    SymTab for definition of data structures and for handling import and export, and
+    GenCode to produce binary code. Parser performs type checking and data allocation.
+    Parser is target-independent, except for part of the handling of allocations.*)
+
+(* $[+ remove procedure names *)
+(* $O- remove overflow checks *)
+(* $T- remove tests *)
+
+  CONST
+    DEBUG = TRUE;
+
+  TYPE
+    PtrBase     = POINTER TO PtrBaseDesc;
+    PtrBaseDesc = RECORD  (*list of names of pointer base types*)
+      name: Scanner.Ident; type: Symbols.Type; next: PtrBase
+    END ;
+
+  VAR
+    sym             : INTEGER; (* last symbol read*)
+    dc              : INTEGER; (* data counter*)
+    newSF           : BOOLEAN;           (* option flag*)
+    modid           : Scanner.Ident;    (* module name *)
+    pbsList         : PtrBase;           (* list of names of pointer base types*)
+    trace           : BOOLEAN;
+
+  PROCEDURE NextToken; BEGIN Expressions.NextToken; sym := Scanner.token END NextToken;
+
+  PROCEDURE Expect(s: INTEGER);
+  BEGIN
+    IF Scanner.token = s THEN NextToken ELSE Scanner.Missing(s) END
+  END Expect;
+
+  PROCEDURE CheckRecLevel*(lev: INTEGER);
+  BEGIN
+    IF lev # 0 THEN Scanner.Mark("ptr base must be global") END
+  END CheckRecLevel;
+
+  PROCEDURE CheckExport(VAR expo: BOOLEAN);
+  BEGIN
+    IF Scanner.token = Token.times THEN
+      expo := TRUE; NextToken;
+      IF Symbols.scopeLevel # 0 THEN Scanner.Mark("remove asterisk") END
+    ELSE expo := FALSE
+    END
+  END CheckExport;
+
+  PROCEDURE Import;
+    VAR impid, impid1: Scanner.Ident;
+  BEGIN
+    IF Scanner.token = Token.ident THEN
+      Scanner.CopyId(impid); NextToken;
+      IF sym = Token.becomes THEN
+        NextToken;
+        IF sym = Token.ident THEN Scanner.CopyId(impid1); NextToken
+        ELSE Scanner.Missing(Token.ident); impid1 := impid
+        END
+      ELSE impid1 := impid
+      END ;
+      Symbols.Import(impid, impid1)
+    ELSE Scanner.Missing(Token.ident)
+    END
+  END Import;
+
+  PROCEDURE IdentList*(class: INTEGER; VAR first: Symbols.Object);
+    VAR obj: Symbols.Object;
+  BEGIN
+    IF Scanner.token = Token.ident THEN
+      Symbols.NewObj(first, Scanner.id, class); NextToken; CheckExport(first.expo);
+      WHILE sym = Token.comma DO
+        NextToken;
+        IF sym = Token.ident THEN
+          Symbols.NewObj(obj, Scanner.id, class); NextToken; CheckExport(obj.expo)
+        ELSE Scanner.Missing(Token.ident)
+        END
+      END;
+      Expect(Token.colon)
+    ELSE first := NIL
+    END
+  END IdentList;
+
+  PROCEDURE ProcedureType(ptype: Symbols.Type; VAR parblksize: INTEGER);
+    VAR first, obj: Symbols.Object; size: INTEGER; nofpar: INTEGER;
+
+    PROCEDURE FormalType(VAR typ: Symbols.Type; dim: INTEGER);
+      VAR obj: Symbols.Object; dmy: INTEGER;
+    BEGIN
+      sym := Scanner.token;
+      IF sym = Token.ident THEN
+        Expressions.qualident(obj);
+        IF obj.class = Symbols.Typ
+        THEN typ := obj.type
+        ELSE Scanner.Mark("not a type"); typ := Symbols.intType
+        END
+      ELSIF sym = Token.array THEN
+        NextToken; Expect(Token.of);
+        IF dim >= 1 THEN Scanner.Mark("multi-dimensional open arrays not implemented") END ;
+        NEW(typ); typ.form := Symbols.Array; typ.len := -1; typ.size := 2*Gen.WordSize;
+        FormalType(typ.base, dim+1)
+      ELSIF sym = Token.procedure THEN
+        NextToken; Symbols.OpenScope;
+        NEW(typ); 
+        typ.form := Symbols.Proc;
+        typ.size := 2*Gen.WordSize;
+        dmy := 0; ProcedureType(typ, dmy);
+        typ.dsc  := Symbols.topScope.next; Symbols.CloseScope
+      ELSE Scanner.Missing(Token.ident); typ := Symbols.noType
+      END
+    END FormalType;
+
+    PROCEDURE FPSection(VAR parblksize: INTEGER; VAR nofpar: INTEGER): Symbols.Object;
+      VAR obj, first: Symbols.Object; tp: Symbols.Type;
+        paramsize: INTEGER; class: INTEGER; rdo: BOOLEAN;
+    BEGIN
+      IF Scanner.token = Token.var
+      THEN class := Symbols.Indirect; NextToken
+      ELSE class := Symbols.Var
+      END ;
+      IdentList(class, first); FormalType(tp, 0); rdo := FALSE;
+      IF (class = Symbols.Var) & (tp.form >= Symbols.Array) THEN class := Symbols.Indirect; rdo := TRUE END ;
+      IF (class # Symbols.Indirect) &
+         ((tp = Symbols.realType) OR (tp = Symbols.longType) OR (tp.form = Symbols.Proc))
+      THEN paramsize := 2
+      ELSE paramsize := 1
+      END;
+      obj := first;
+      WHILE obj # NIL DO
+        INC(nofpar);
+        obj.class  := class;
+        obj.type   := tp;
+        obj.rdo    := rdo;
+        obj.lev    := Symbols.scopeLevel;
+        parblksize := parblksize + paramsize;
+        obj.val    := parblksize; (* correct offset will be calculated once all formal params are stored *)
+        IF (tp.form = Symbols.Array)   & (tp.len < 0)         (* open array *)
+        OR (tp.form = Symbols.Record)  & (tp.nofpar # 0)      (* tagged record *)
+        THEN
+          INC(parblksize)    (* another word for length of open array / type tag of record *)
+        END;
+        obj        := obj.next
+      END ;
+      IF nofpar > 60 THEN Scanner.Mark("too many parameters") END;
+      RETURN first
+    END FPSection;
+
+  BEGIN (* ProcedureType *)
+    ptype.base := Symbols.noType;
+    nofpar      := 0;
+    ptype.dsc  := NIL;
+    parblksize  := 0;
+    IF Scanner.token = Token.lparen THEN
+      NextToken;
+      IF sym = Token.rparen THEN NextToken
+      ELSE
+        first := FPSection(parblksize, nofpar);
+        WHILE Scanner.token = Token.semicolon DO
+          NextToken;
+          obj := FPSection(parblksize, nofpar)
+        END;
+        Expect(Token.rparen);
+        obj := first;
+        WHILE obj # NIL DO
+          obj.val := parblksize - obj.val + 3; (* fixes offsets of params *)
+          obj := obj.next
+        END;
+      END;
+      IF Scanner.token = Token.colon THEN  (*function*)
+        NextToken;
+        IF sym = Token.ident THEN
+          Expressions.qualident(obj); ptype.base := obj.type;
+          IF ~((obj.class = Symbols.Typ) & (obj.type.form IN {Symbols.Byte .. Symbols.Pointer, Symbols.Proc})) THEN
+            Scanner.Mark("illegal function type")
+          END
+        ELSE Scanner.Mark("type identifier expected")
+        END
+      END
+    END ;
+    ptype.nofpar := nofpar;
+  END ProcedureType;
+
+PROCEDURE Type(VAR type: Symbols.Type);
+  VAR dmy: INTEGER; obj: Symbols.Object; ptbase: PtrBase;
+
+  PROCEDURE ArrayType(VAR type: Symbols.Type);
+    VAR x: Gen.Item; typ: Symbols.Type; len: INTEGER;
+  BEGIN NEW(typ); typ.form := Symbols.NoTyp;
+    Expressions.expression(x);
+    IF (x.mode = Symbols.Const) & (x.type.form = Symbols.Int) & (x.a >= 0)
+    THEN len := x.a
+    ELSE len := 1; Scanner.Mark("not a valid length")
+    END ;
+    IF Scanner.token = Token.of THEN NextToken; Type(typ.base);
+      IF (typ.base.form = Symbols.Array) & (typ.base.len < 0) THEN
+        Scanner.Mark("dyn array not allowed")
+      END
+    ELSIF Scanner.token = Token.comma THEN NextToken; ArrayType(typ.base)
+    ELSE Scanner.Missing(Token.of); typ.base := Symbols.intType
+    END ;
+    typ.size := len * typ.base.size;
+    typ.form := Symbols.Array;
+    typ.len  := len;
+    type := typ
+  END ArrayType;
+
+  PROCEDURE RecordType(VAR type: Symbols.Type; tagged: BOOLEAN);
+    VAR obj, obj0, new, bot, base: Symbols.Object;
+      typ, tp: Symbols.Type;
+      offset, off, n, size: INTEGER;
+  BEGIN
+    NEW(typ);
+    typ.form   := Symbols.NoTyp;
+    typ.base   := NIL;
+    typ.mno    := -Symbols.scopeLevel;
+    typ.nofpar := ORD(tagged);       (* 1 if base-type tagged record, 0 if non-tagged *)
+    offset     := 0;
+    bot        := NIL;
+    IF Scanner.token = Token.lparen THEN (*record extension*)
+      NextToken;
+      IF Symbols.scopeLevel # 0 THEN Scanner.Mark("extension of local types not implemented") END ;
+      IF sym = Token.ident THEN
+        Expressions.qualident(base);
+        IF base.class = Symbols.Typ THEN
+          IF (base.type.form = Symbols.Record) & (base.type.nofpar # 0)
+          THEN typ.base := base.type
+          ELSE typ.base := Symbols.intType; Scanner.Mark("invalid extension")
+          END ;
+          typ.nofpar := typ.base.nofpar + 1; (*"nofpar" here abused for extension level*)
+          bot        := typ.base.dsc;
+          offset     := typ.base.size        (* start after the base type *)
+        ELSE Scanner.Mark("type expected")
+        END
+      ELSE Scanner.Missing(Token.ident)
+      END ;
+      Expect(Token.rparen)
+    END ;
+    WHILE Scanner.token = Token.ident DO  (*fields*)
+      n := 0; obj := bot;
+      WHILE Scanner.token = Token.ident DO
+        obj0 := obj;
+        WHILE (obj0 # NIL) & (obj0.name # Scanner.id) DO obj0 := obj0.next END ;
+        IF obj0 # NIL THEN Scanner.Mark("mult def") END ;
+        NEW(new); Scanner.CopyId(new.name); new.class := Symbols.Fld; new.next := obj; obj := new; INC(n);
+        NextToken; CheckExport(new.expo);
+        IF (sym # Token.comma) & (sym # Token.colon) THEN Scanner.Missing(Token.comma)
+        ELSIF sym = Token.comma THEN NextToken
+        END
+      END ;
+      Expect(Token.colon); Type(tp);
+      IF (tp.form = Symbols.Array) & (tp.len < 0) THEN Scanner.Mark("dyn array not allowed") END ;
+      size := tp^.size;
+      offset := offset + size * n;
+      off := offset; obj0 := obj; (* handle objects of same type, backwards *)
+      WHILE obj0 # bot DO
+        obj0.type := tp;
+        obj0.lev  := 0;
+        off       := off - size;
+        obj0.val  := off;
+        obj0      := obj0.next
+      END ;
+      bot := obj;
+      IF    Scanner.token = Token.semicolon THEN NextToken
+      ELSIF Scanner.token # Token.end       THEN Scanner.Mark(" ; or END")
+      END
+    END ;
+    typ.form := Symbols.Record;
+    typ.dsc  := bot;
+    typ.size := offset;
+    type     := typ
+  END RecordType;
+
+
+BEGIN (* Type *)
+    type := Symbols.intType; (*sync*)
+    IF (Scanner.token # Token.ident) & (Scanner.token < Token.array) THEN Scanner.Mark("not a type");
+      REPEAT NextToken UNTIL (sym = Token.ident) OR (sym >= Token.array)
+    END ;
+    sym := Scanner.token;
+    IF sym = Token.ident THEN
+      Expressions.qualident(obj);
+      IF obj.class = Symbols.Typ THEN
+        IF (obj.type # NIL) & (obj.type.form # Symbols.NoTyp) THEN type := obj.type END
+      ELSE Scanner.Mark("not a type or undefined")
+      END
+    ELSIF sym = Token.array THEN NextToken; ArrayType(type)
+    ELSIF sym = Token.tagged THEN NextToken; Expect(Token.record);
+      RecordType(type, TRUE); Expect(Token.end)
+    ELSIF sym = Token.record THEN NextToken;
+      RecordType(type, FALSE); Expect(Token.end)
+    ELSIF sym = Token.pointer THEN
+      NextToken; Expect(Token.to);
+      NEW(type);
+      type.form := Symbols.Pointer;
+      type.size := Gen.WordSize;
+      type.base := Symbols.intType;
+      IF sym = Token.ident THEN
+        obj := Symbols.thisObj();
+        IF obj # NIL THEN
+          IF (obj.class = Symbols.Typ) & (obj.type.form IN {Symbols.Record, Symbols.NoTyp}) THEN
+            CheckRecLevel(obj.lev); type.base := obj.type
+          ELSIF obj.class = Symbols.Mod THEN Scanner.Mark("external base type not implemented")
+          ELSE Scanner.Mark("no valid base type")
+          END
+        ELSE
+          CheckRecLevel(Symbols.scopeLevel);
+          (*enter into list of forward references to be fixed in Declarations*)
+          NEW(ptbase);
+          Scanner.CopyId(ptbase.name);
+          ptbase.type := type;
+          ptbase.next := pbsList;
+          pbsList     := ptbase
+        END ;
+        NextToken
+      ELSE Type(type.base);
+        IF (type.base.form # Symbols.Record) OR (type.base.typobj = NIL) THEN Scanner.Mark("must point to named record") END ;
+        CheckRecLevel(Symbols.scopeLevel)
+      END
+    ELSIF sym = Token.procedure THEN
+      NextToken; Symbols.OpenScope;
+      NEW(type); type.form := Symbols.Proc; type.size := 2*Gen.WordSize; dmy := 0;
+      ProcedureType(type, dmy); type.dsc := Symbols.topScope.next; Symbols.CloseScope
+    ELSE Scanner.Mark("illegal type")
+    END
+END Type;
+
+  PROCEDURE Declarations(VAR nofvars: INTEGER; (* LONGINT and REAL vars are counted as 2 word variables *)
+                         VAR arraySizes: Gen.VarSizes);
+    VAR obj, first: Symbols.Object;
+      x: Gen.Item; tp: Symbols.Type; ptbase: PtrBase;
+      expo: BOOLEAN; id: Scanner.Ident;
+      size: INTEGER;
+  BEGIN
+    nofvars := 0;
+    (*sync*) pbsList := NIL;
+    sym := Scanner.token;
+    IF (sym < Token.const) & (sym # Token.end) & (sym # Token.return) THEN Scanner.Mark("declaration?");
+      REPEAT NextToken UNTIL (sym >= Token.const) OR (sym = Token.end) OR (sym = Token.return)
+    END ;
+    IF sym = Token.const THEN
+      NextToken;
+      WHILE sym = Token.ident DO
+        Scanner.CopyId(id); NextToken; CheckExport(expo);
+        Expect(Token.eql);
+        Expressions.expression(x);
+        Symbols.NewObj(obj, id, Symbols.Const); obj.expo := expo;
+        IF x.mode = Symbols.Const THEN
+          obj.val       := x.a;
+          obj.extension := x.msw;
+          obj.lev       := x.b;
+          obj.type      := x.type
+        ELSE Scanner.Mark("expression not constant"); obj.type := Symbols.intType
+        END;
+        Expect(Token.semicolon)
+      END
+    END ;
+    IF sym = Token.type THEN
+      NextToken;
+      WHILE sym = Token.ident DO
+        Scanner.CopyId(id); NextToken; CheckExport(expo);
+        Expect(Token.eql);
+        Type(tp);
+        Symbols.NewObj(obj, id, Symbols.Typ);
+        obj.type := tp;
+        obj.expo := expo;
+        obj.lev  := Symbols.scopeLevel;
+        IF tp.typobj = NIL THEN tp.typobj := obj END ;
+(*
+        IF expo & (tp.form = Symbols.Record)
+        THEN obj.exno := exno; INC(exno)
+        ELSE obj.exno := 0
+        END ;
+*)
+        IF tp.form = Symbols.Record THEN
+          ptbase := pbsList;  (*check whether this is base of a pointer type; search and fixup*)
+          WHILE ptbase # NIL DO
+            IF obj.name = ptbase.name THEN ptbase.type.base := obj.type END ;
+            ptbase := ptbase.next
+          END ;
+          IF (Symbols.scopeLevel = 0) & (tp.nofpar # 0) THEN
+            tp.len := nofvars + 2; (* len field used as global offset *)
+            arraySizes[tp.len] := tp.size;
+            Gen.BuildTD(tp);
+            INC(nofvars)
+          END
+        END ;
+        Expect(Token.semicolon)
+      END
+    END ;
+    IF sym = Token.var THEN
+      NextToken;
+      WHILE sym = Token.ident DO
+        IdentList(Symbols.Var, first); Type(tp);
+        obj := first;
+        WHILE obj # NIL DO
+          obj.type := tp;
+          obj.lev  := Symbols.scopeLevel;
+          IF (tp.form = Symbols.Record) OR (tp.form = Symbols.Array)
+          THEN size := 1; arraySizes[nofvars+2] := tp.size (* records and arrays becomes pointers *)
+          ELSE size := (tp.size + 1) DIV 2; (* size in words *)
+          END;
+          nofvars := nofvars + size;
+          IF Symbols.scopeLevel > 0 (* local variables have negative offsets *)
+          THEN obj.val := -(nofvars + 1)     (*  local variables #0 and #1 are reserved *)
+          ELSE obj.val := nofvars - size + 2 (* global variables #0 and #1 are reserved *)
+          END;
+(*
+          IF obj.expo THEN obj.exno := exno; INC(exno) END ;
+*)
+          obj := obj.next
+        END ;
+        Expect(Token.semicolon)
+      END
+    END ;
+    ptbase := pbsList;
+    WHILE ptbase # NIL DO
+      IF ptbase.type.base.form = Symbols.Int THEN Scanner.Mark("undefined pointer base of") END ;
+      ptbase := ptbase.next
+    END ;
+    IF (sym >= Token.const) & (sym <= Token.var) THEN Scanner.Mark("declaration in bad order") END
+  END Declarations;
+
+  PROCEDURE ProcedureDecl;
+    VAR
+      proc  : Symbols.Object;
+      savedType, currentProcType : Symbols.Type;
+      procid: Scanner.Ident;
+      x     : Gen.Item;
+      paramBlockSize, locblksize, savedSize: INTEGER;
+      arraySizes: Gen.VarSizes;
+      heap : INTEGER;
+  BEGIN
+    NextToken;
+    IF sym = Token.ident THEN
+      Scanner.CopyId(procid); NextToken;
+      Symbols.NewObj(proc, Scanner.id, Symbols.Const);
+      savedSize := Symbols.paramBlockSize;
+      savedType := Symbols.currentProcType;
+      NEW(currentProcType);
+      currentProcType.form := Symbols.Proc;
+      currentProcType.size := Gen.WordSize * 2;
+      proc.type := currentProcType;
+      proc.lev  := Symbols.scopeLevel;
+      proc.val  := Gen.NextProcNum();
+      CheckExport(proc.expo);
+      Symbols.OpenScope; Symbols.IncScopeLevel;
+      currentProcType.base := Symbols.noType;
+      paramBlockSize := 0;
+      ProcedureType(currentProcType, paramBlockSize);  (*formal parameter list*)
+      Expect(Token.semicolon);
+      SYSTEM.MARK(heap);
+      Declarations(locblksize, arraySizes);
+      proc.type.dsc := Symbols.topScope.next;
+      IF Scanner.token = Token.procedure THEN
+        REPEAT ProcedureDecl; Expect(Token.semicolon) UNTIL sym # Token.procedure;
+        proc.type.dsc := Symbols.topScope.next
+      END ;
+      Gen.Enter(proc, paramBlockSize, locblksize, arraySizes);
+      Expect(Token.begin);
+      Symbols.SetCurrentProc(currentProcType, paramBlockSize); (* for access by StatSequence *)
+      Statements.StatSequence;
+      IF Scanner.extensions THEN  (* multiple RETURNs allowed *)
+        IF currentProcType.base = Symbols.noType THEN
+          Gen.Return(currentProcType.base.form, x, paramBlockSize)
+        ELSE Gen.MissingReturn
+        END
+      ELSE
+        IF Scanner.token = Token.return THEN
+          NextToken; Expressions.expression(x);
+          IF currentProcType.base = Symbols.noType THEN Scanner.Mark("this is not a function")
+          ELSIF NOT Expressions.CompTypes(currentProcType.base, x.type, FALSE) THEN Scanner.Mark("wrong result type")
+          END
+        ELSIF currentProcType.base.form # Symbols.NoTyp THEN
+          Scanner.Mark("function without result"); currentProcType.base := Symbols.noType
+        END ;
+        Gen.Return(currentProcType.base.form, x, paramBlockSize);
+      END;
+      Gen.EndProc;
+      Symbols.CloseScope; Symbols.DecScopeLevel;
+      Symbols.SetCurrentProc(savedType, savedSize);
+      Expect(Token.end);
+      IF sym = Token.ident THEN
+        IF Scanner.id # procid THEN Scanner.Mark("no match") END ;
+        NextToken
+      ELSE Scanner.Mark("no proc id")
+      END;
+      SYSTEM.RELEASE(heap)
+    ELSE Scanner.Mark("proc id expected")
+    END;
+  END ProcedureDecl;
+
+  PROCEDURE Module;
+    VAR key: INTEGER;
+        arraySizes: Gen.VarSizes;
+        i, staticSize : INTEGER;
+        bssSize : LONGINT;
+  BEGIN
+    Symbols.Init; Symbols.OpenScope;
+
+    NextToken;
+    Expect(Token.module);
+    IF sym = Token.ident THEN
+      Scanner.CopyId(modid); NextToken;
+    ELSE Scanner.Missing(Token.ident)
+    END ;
+    Expect(Token.semicolon);
+    key := 0; (* exno := 1; *)
+    IF sym = Token.import THEN
+      NextToken; Import;
+      WHILE Scanner.token = Token.comma DO NextToken; Import END ;
+      Expect(Token.semicolon);
+    END ;
+    Gen.Open(modid);
+    Declarations(dc, arraySizes);
+    Gen.SetDataSize(dc);
+    WHILE Scanner.token = Token.procedure DO
+      ProcedureDecl; Expect(Token.semicolon)
+    END ;
+    Gen.Header(modid);
+    IF Scanner.token = Token.begin THEN NextToken; Statements.StatSequence END ;
+    Expect(Token.end);
+    IF sym = Token.ident THEN
+      IF Scanner.id # modid THEN Scanner.Mark("no match") END ;
+      NextToken
+    ELSE Scanner.Missing(Token.ident)
+    END ;
+    Expect(Token.period);
+    Scanner.Close;
+    IF Scanner.errcnt = 0 THEN
+      Symbols.Export(modid, newSF, key);
+      Gen.Close(modid, key, arraySizes);
+      staticSize := Gen.Here();
+      Out.String("Static size:"); Out.Int(staticSize, 6);
+      bssSize := LONG(0);
+      FOR i:=2 TO dc+1 DO bssSize := bssSize + LONG(arraySizes[i]) END;
+      Out.String(", bss:"); Out.Long(bssSize, 6); Out.String(" bytes.");
+    ELSE
+      Out.Ln; Out.String("Errors found, see ERR file");
+      ComLine.Chain("EDIT", Scanner.inName, "", "", "")
+    END;
+    Out.Ln;
+    Symbols.CloseScope;
+  END Module;
+
+BEGIN
+  Out.String("Oberon to MCODE Compiler 26.1.2022"); Out.Ln;
+  IF Scanner.Init(ComLine.arg1) THEN Module
+  ELSE Out.String("File not found."); Out.Ln
+  END;
+END Oberon.
+

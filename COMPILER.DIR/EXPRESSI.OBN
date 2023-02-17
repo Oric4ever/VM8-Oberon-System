@@ -1,0 +1,620 @@
+MODULE Expressions; (*N. Wirth 1.7.97 / 8.3.2020  Oberon compiler *)
+  IMPORT SYSTEM, Token, Scanner, Symbols, Gen := Gen2;
+  (*Author: Niklaus Wirth, 2014.
+    Parser of Oberon compiler. Uses Scanner to obtain symbols (tokens),
+    SymTab for definition of data structures and for handling import and export, and
+    GenCode to produce binary code. Parser performs type checking and data allocation.
+    Parser is target-independent, except for part of the handling of allocations.*)
+
+(* $[+ remove procedure names *)
+(* $O- remove overflow checks *)
+(* $T- remove tests *)
+
+  CONST
+    DEBUG = FALSE;
+
+    (* Unary gencode ops *)
+    DeRef=1; Not=2; And1=3; Or1=4; Neg=5; Singleton=6; StrToChar=7;
+    OpenArrayParam=8; Dispose=9; StringParam=10; For1a=11; Cap=12;
+    GetContent=13; New=14; Call=15; PrepCall=16; Abs=17; Odd=18; Floor=19;
+    Float=20; Ord=21; Len=22; Chr=23; Get=24; Adr=25; GetCarry=26;
+    Store1=27; Commut1=28; Expr1=29; Relation1=30; Index1=31; Int2Long=32; Long2Int=33;
+    Mark=34; Release=35; FreeMem=36; Lsw=37; Msw=38;
+
+    (* Binary gencode ops *)
+    Index2=1; Add2=2; Sub2=3; Div2=4; Mod2=5; And2=6; Or2=7; Mul2=8;
+    RealAdd2=9; RealSub2=10; RealMul2=11; RealDiv2=12; Range=13; In=14; Store2=15;
+    StoreStruct=16; CopyString=17; For0=18; For1b=19; For2=20; Increment=21; Put=22;
+    ADDC=23; SUBC=24; MULC=25; DIVC=26; Sys=27;
+    Include=28; Exclude=29; Allocate=30; Dealloc=31; PackLong=32; Asr=33; Lsl=34;
+
+  TYPE
+    PtrBase     = POINTER TO PtrBaseDesc;
+    PtrBaseDesc = RECORD  (*list of names of pointer base types*)
+      name: Scanner.Ident; type: Symbols.Type; next: PtrBase
+    END ;
+
+  VAR
+    sym*  : INTEGER; (* last symbol read*)
+    expressionProc: PROCEDURE(VAR x: Gen.Item);  (*to avoid forward reference*)
+
+  PROCEDURE NextToken*; BEGIN Scanner.Get(sym) END NextToken;
+
+  PROCEDURE Expect*(s: INTEGER);
+  BEGIN
+    IF sym = s THEN NextToken ELSE Scanner.Missing(s) END
+  END Expect;
+
+  PROCEDURE qualident*(VAR obj: Symbols.Object);
+  BEGIN
+    obj := Symbols.thisObj(); NextToken;
+    IF obj = NIL THEN Scanner.Mark("undef"); obj := Symbols.dummy END ;
+    IF (sym = Token.period) & (obj.class = Symbols.Mod) THEN
+      NextToken;
+      IF sym = Token.ident THEN obj := Symbols.thisimport(obj); NextToken;
+        IF obj = NIL THEN Scanner.Mark("undef"); obj := Symbols.dummy END
+      ELSE Scanner.Missing(Token.ident); obj := Symbols.dummy
+      END
+    END
+  END qualident;
+
+  PROCEDURE CheckBool*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Bool THEN Scanner.Mark("not Boolean"); x.type := Symbols.boolType END
+  END CheckBool;
+
+  PROCEDURE CheckInt*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Int THEN Scanner.Mark("not Integer"); x.type := Symbols.intType END
+  END CheckInt;
+
+  PROCEDURE CheckLong*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Long THEN Scanner.Mark("not LongInt"); x.type := Symbols.longType END
+  END CheckLong;
+
+  PROCEDURE CheckReal*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Real THEN Scanner.Mark("not Real"); x.type := Symbols.realType END
+  END CheckReal;
+
+  PROCEDURE CheckSet*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Set THEN Scanner.Mark("not Set"); x.type := Symbols.setType END
+  END CheckSet;
+
+  PROCEDURE CheckSetVal*(VAR x: Gen.Item);
+  BEGIN
+    IF x.type.form # Symbols.Int THEN Scanner.Mark("not Int"); x.type := Symbols.setType
+    ELSIF x.mode = Symbols.Const THEN
+      IF (x.a < 0) OR (x.a > 15) THEN Scanner.Mark("invalid set") END
+    END
+  END CheckSetVal;
+
+  PROCEDURE CheckConst*(VAR x: Gen.Item);
+  BEGIN
+    IF x.mode # Symbols.Const THEN Scanner.Mark("not a constant"); x.mode := Symbols.Const END
+  END CheckConst;
+
+  PROCEDURE CheckWritable*(VAR x: Gen.Item);
+  BEGIN
+    IF x.rdo THEN Scanner.Mark("read-only") END
+  END CheckWritable;
+
+  PROCEDURE IsExtension*(t0, t1: Symbols.Type): BOOLEAN;
+  BEGIN (*t1 is an extension of t0*)
+    RETURN (t0 = t1) OR (t1 # NIL) & IsExtension(t0, t1.base)
+  END IsExtension;
+
+  (* check that T is one of x's base types *)
+  PROCEDURE TypeTest*(VAR x: Gen.Item; T: Symbols.Type; guard: BOOLEAN);
+    VAR xt: Symbols.Type;
+  BEGIN
+    xt := x.type;
+    IF (T.form = xt.form )
+    & ((T.form = Symbols.Pointer) OR
+       (T.form = Symbols.Record) & (x.mode = Symbols.Indirect)) THEN
+      WHILE (xt # T) & (xt # NIL) DO xt := xt.base END ;
+      IF xt = NIL THEN (* T not found in base types *)
+        xt := x.type; (* return to x's type *)
+        IF xt.form = Symbols.Pointer THEN
+          IF IsExtension(xt.base, T.base) THEN Gen.TypeTest(x, T.base, FALSE, guard); x.type := T
+          ELSE Scanner.Mark("not an extension")
+          END
+        ELSIF (xt.form = Symbols.Record) & (x.mode = Symbols.Indirect) THEN
+          IF IsExtension(xt, T) THEN Gen.TypeTest(x, T, TRUE, guard); x.type := T
+          ELSE Scanner.Mark("not an extension")
+          END
+        ELSE Scanner.Mark("incompatible types")
+        END
+      ELSIF ~guard THEN
+        Gen.TypeTest(x, NIL, FALSE, FALSE)
+      END
+    ELSE Scanner.Mark("type mismatch")
+    END ;
+    IF ~guard THEN x.type := Symbols.boolType END
+  END TypeTest;
+
+  PROCEDURE selector*(VAR x: Gen.Item);
+    VAR y: Gen.Item; obj: Symbols.Object;
+  BEGIN
+    sym := Scanner.token;
+    WHILE (sym = Token.lbrak)    (* array index *)
+       OR (sym = Token.period)   (* record field *)
+       OR (sym = Token.arrow)    (* pointer dereferencement *)
+       OR (sym = Token.lparen) & (x.type.form IN {Symbols.Record, Symbols.Pointer}) (* type guard *)
+    DO
+      IF sym = Token.lbrak THEN
+        REPEAT
+          Gen.Unary(Index1, x);
+          NextToken; expressionProc(y);
+          IF x.type.form = Symbols.Array THEN
+            CheckInt(y); Gen.Binary(Index2, x, y); x.type := x.type.base
+          ELSE Scanner.Mark("not an array")
+          END
+        UNTIL sym # Token.comma;
+        Expect(Token.rbrak)
+      ELSIF sym = Token.period THEN NextToken;
+        IF sym = Token.ident THEN
+          IF x.type.form = Symbols.Pointer THEN
+            Gen.Unary(DeRef, x);
+            x.type := x.type.base
+          END ;
+          IF x.type.form = Symbols.Record THEN
+            obj := Symbols.thisfield(x.type); NextToken;
+            IF obj # NIL THEN Gen.Field(x, obj); x.type := obj.type
+            ELSE Scanner.Mark("undef")
+            END
+          ELSE Scanner.Mark("not a record")
+          END
+        ELSE Scanner.Missing(Token.ident)
+        END
+      ELSIF sym = Token.arrow THEN
+        NextToken;
+        IF x.type.form = Symbols.Pointer THEN
+          Gen.Unary(DeRef, x);
+          x.type := x.type.base
+        ELSE Scanner.Mark("not a pointer")
+        END
+      ELSIF (sym = Token.lparen) & (x.type.form IN {Symbols.Record, Symbols.Pointer}) THEN (*type guard*)
+        NextToken;
+        IF sym = Token.ident THEN
+          qualident(obj);
+          IF obj.class = Symbols.Typ THEN TypeTest(x, obj.type, TRUE)
+          ELSE Scanner.Mark("guard type expected")
+          END
+        ELSE Scanner.Missing(Token.ident)
+        END ;
+        Expect(Token.rparen)
+      END
+    END
+  END selector;
+
+  PROCEDURE EqualSignatures*(t0, t1: Symbols.Type): BOOLEAN;
+    VAR p0, p1: Symbols.Object;
+        compat: BOOLEAN;
+  BEGIN
+    compat := TRUE;
+    IF (t0.base = t1.base) & (t0.nofpar = t1.nofpar) THEN
+      p0 := t0.dsc; p1 := t1.dsc;
+      WHILE p0 # NIL DO
+
+        IF (p0.class = p1.class)
+        &  (p0.rdo   = p1.rdo)
+        &  (
+               (p0.type = p1.type)
+            OR (p0.type.form = Symbols.Array)
+             & (p1.type.form = Symbols.Array)
+             & (p0.type.len  = p1.type.len)
+             & (p0.type.base = p1.type.base)
+            OR (p0.type.form = Symbols.Proc)
+             & (p1.type.form = Symbols.Proc)
+             & EqualSignatures(p0.type, p1.type)
+           )
+        THEN p0 := p0.next; p1 := p1.next
+        ELSE p0 := NIL; compat := FALSE
+        END
+      END
+    ELSE compat := FALSE
+    END ;
+    RETURN compat
+  END EqualSignatures;
+
+  (* check for assignment compatibility *)
+  PROCEDURE CompTypes*(t0, t1: Symbols.Type; varpar: BOOLEAN): BOOLEAN;
+  VAR form0, form1: INTEGER;
+  BEGIN
+    form0 := t0.form;
+    form1 := t1.form;
+    RETURN (t0 = t1)
+
+      OR   (form0 = Symbols.Array)
+         & (form1 = Symbols.Array)
+         & (t0.base = t1.base)
+         & (t0.len  = t1.len)         (* NB: openarray assignment disallowed in ORG *)
+
+      OR   (form0 = Symbols.Record)  (* FF: added compatibility of pointers with records *)
+         & (   (form1 = Symbols.Record)  & IsExtension(t0, t1)
+            OR (form1 = Symbols.Pointer) & IsExtension(t0, t1.base)
+           )
+
+      OR   (form0 = Symbols.Pointer) (* FF: allowed this even for VAR params, why not? *)
+         & (form1 = Symbols.Pointer)
+         & IsExtension(t0.base, t1.base)
+
+      OR   ~varpar
+        & (
+             (form0 = Symbols.Proc)
+           & (form1 = Symbols.Proc)
+           & EqualSignatures(t0, t1)
+
+          OR (form0 IN {Symbols.Pointer, Symbols.Proc})
+           & (form1 = Symbols.NilTyp))
+  END CompTypes;
+
+  PROCEDURE ParamList*(VAR x: Gen.Item);
+    VAR n: INTEGER; par: Symbols.Object;
+
+    PROCEDURE Parameter(par: Symbols.Object);
+      VAR x: Gen.Item;
+          varpar: BOOLEAN;
+          xForm, parForm: INTEGER;
+    BEGIN
+      expressionProc(x);
+      IF par # NIL THEN
+        xForm  :=   x.type.form;
+        parForm:= par.type.form;
+        varpar := par.class = Symbols.Indirect;
+
+        IF CompTypes(par.type, x.type, varpar) THEN
+          IF NOT varpar OR (parForm = Symbols.Record) & (xForm = Symbols.Pointer)
+          THEN Gen.ValueParam(x, par.type)
+          ELSE (* par.class = Indirect *)
+            IF NOT par.rdo THEN CheckWritable(x) END ;
+            Gen.VarParam(x, par.type)
+          END
+
+        ELSIF (xForm = Symbols.Array) & (parForm = Symbols.Array) &
+              (x.type.base = par.type.base) & (par.type.len < 0) THEN
+          IF NOT par.rdo THEN CheckWritable(x) END ;
+          Gen.Unary(OpenArrayParam, x)
+
+        ELSIF (xForm = Symbols.String) & varpar & par.rdo &
+            (parForm = Symbols.Array) &
+            (par.type.base.form = Symbols.Char) & (par.type.len < 0) THEN
+          Gen.Unary(StringParam, x)
+
+        ELSIF (parForm = Symbols.Int) & (xForm = Symbols.Int) & NOT(varpar) THEN
+          Gen.ValueParam(x, par.type)  (* BYTE *)
+
+        ELSIF (xForm = Symbols.String) & (x.b = 1) &
+              (par.class = Symbols.Var) & (parForm = Symbols.Char) THEN (* 1-char STRING *)
+          Gen.Unary(StrToChar, x);
+          Gen.ValueParam(x, par.type)
+
+        ELSIF (parForm = Symbols.Array) & (par.type.base = Symbols.byteType)
+              & (xForm = Symbols.Array) THEN (* ARRAY OF BYTE *)
+          Gen.VarParam(x, par.type)
+
+        ELSE Scanner.Mark("incompatible parameters")
+        END
+      END
+    END Parameter;
+
+  BEGIN (* ParamList *)
+    par := x.type.dsc; n := 0;
+    IF sym # Token.rparen THEN
+      Parameter(par); n := 1;
+      WHILE sym <= Token.comma DO
+        Expect(Token.comma);
+        IF par # NIL THEN par := par.next END ;
+        INC(n); Parameter(par)
+      END ;
+      Expect(Token.rparen)
+    ELSE NextToken;
+    END ;
+    IF n < x.type.nofpar THEN Scanner.Mark("too few params")
+    ELSIF n > x.type.nofpar THEN Scanner.Mark("too many params")
+    END
+  END ParamList;
+
+  PROCEDURE expression*(VAR x: Gen.Item);
+    VAR y: Gen.Item; obj: Symbols.Object; rel, xf, yf: INTEGER;
+
+    PROCEDURE StandFunc(VAR x: Gen.Item; fct: INTEGER; restyp: Symbols.Type);
+      VAR y: Gen.Item; n, npar: INTEGER;
+    BEGIN
+      Expect(Token.lparen);
+      npar := fct MOD 10; fct := fct DIV 10;
+      n := 0;
+      IF npar >= 1 THEN
+        expression(x);
+        IF npar >= 2 THEN (* functions of 2+ params have params by value, except VAL *)
+          IF (fct = 9) OR (fct = 25) THEN
+            IF x.type.form IN {Symbols.Int, Symbols.Long}
+            THEN Gen.ValueParam(x, x.type)
+            ELSE Scanner.Mark("bad type")
+            END
+          ELSIF fct # 15 THEN
+            Gen.ValueParam(x, Symbols.intType)
+          END
+        END;
+        n := 1;
+        WHILE sym = Token.comma DO
+          NextToken;
+          expression(y); Gen.ValueParam(y, Symbols.intType);
+          INC(n)
+        END ;
+      END;
+      Expect(Token.rparen);
+      IF (n = npar) OR (fct = 7) & (n = 1) THEN
+        IF fct = 0 THEN (*ABS*)
+          IF x.type.form IN {Symbols.Int, Symbols.Long, Symbols.Real}
+          THEN Gen.Unary(Abs, x); restyp := x.type
+          ELSE Scanner.Mark("bad type")
+          END
+        ELSIF fct = 1 THEN (* ODD *) CheckInt (x); Gen.Unary(Odd, x)
+        ELSIF fct = 2 THEN (*FLOOR*) CheckReal(x); Gen.Unary(Floor, x)
+        ELSIF fct = 3 THEN (* FLT *)
+          IF x.type.form IN {Symbols.Int, Symbols.Long}
+          THEN Gen.Unary(Float, x)
+          ELSE Scanner.Mark("bad type")
+          END
+        ELSIF fct = 4 THEN (* ORD *)
+          IF x.type.form <= Symbols.Proc THEN Gen.Unary(Ord, x)
+          ELSIF (x.type.form = Symbols.String) & (x.b = 1) THEN Gen.Unary(StrToChar, x)
+          ELSE Scanner.Mark("bad type")
+          END
+        ELSIF fct = 5 THEN (* CHR *) CheckInt (x); Gen.Unary(Chr, x)
+        ELSIF fct = 6 THEN (* LEN *)
+            IF x.type.form = Symbols.Array THEN Gen.Unary(Len, x) ELSE Scanner.Mark("not an array") END
+        ELSIF fct = 7 THEN (* LONG*)
+          CheckInt(x);
+          IF    n = 1 THEN  Gen.Unary (Int2Long, x)
+          ELSE CheckInt(y); Gen.Binary(PackLong, x, y)
+          END
+        ELSIF fct = 8 THEN (* INT *) CheckLong(x); Gen.Unary(Long2Int, x)
+        ELSIF fct = 9 THEN (* ASR *) Gen.Binary(Asr, x, y)
+        ELSIF fct = 10 THEN (*CARRY*) Gen.Unary (GetCarry, x)
+        ELSIF fct = 11 THEN (* ADDC*) Gen.Binary(ADDC, x, y)
+        ELSIF fct = 12 THEN (* SUBC*) Gen.Binary(SUBC, x, y)
+        ELSIF fct = 13 THEN (* MULC*) Gen.Binary(MULC, x, y)
+        ELSIF fct = 14 THEN (* DIVC*) Gen.Binary(DIVC, x, y)
+        ELSIF fct = 15 THEN (* VAL *)
+          IF (x.mode= Symbols.Typ) & (x.type.size <= y.type.size) THEN restyp := x.type; x := y
+          ELSE Scanner.Mark("casting not allowed")
+          END
+        ELSIF fct = 16 THEN (* ADR *) Gen.Unary(Adr, x)
+        ELSIF fct = 17 THEN (* SIZE*)
+          IF x.mode = Symbols.Typ THEN Gen.MakeConstItem(x, Symbols.intType, x.type.size)
+          ELSE Scanner.Mark("must be a type")
+          END
+        ELSIF fct = 18 THEN (* SYS *) Gen.Binary(Sys, x, y)
+        ELSIF fct = 19 THEN (* GET *) Gen.Unary (Get, x)
+        ELSIF fct = 20 THEN (* FREEMEM *) Gen.Unary(FreeMem, x)
+        ELSIF fct = 21 THEN (* LSW *) CheckLong(x); Gen.Unary(Lsw, x)
+        ELSIF fct = 22 THEN (* MSW *) CheckLong(x); Gen.Unary(Msw, x)
+        ELSIF fct = 23 THEN (* SCAN *) Gen.Scan
+        ELSIF fct = 24 THEN (* CAP *)
+          IF (x.type.form = Symbols.String) & (x.b = 1) THEN Gen.Unary(StrToChar,x) END;
+          IF x.type = Symbols.charType THEN Gen.Unary(Cap, x)
+          ELSE Scanner.Mark("bad type")
+          END
+        ELSIF fct = 25 THEN (* LSL *) Gen.Binary(Lsl, x, y)
+        END ;
+        IF (fct # 9) AND (fct # 25) THEN x.type := restyp END
+      ELSE Scanner.Mark("wrong nof params")
+      END
+    END StandFunc;
+
+    PROCEDURE element(VAR x: Gen.Item);
+      VAR y: Gen.Item;
+    BEGIN
+      expression(x); CheckSetVal(x);
+      IF sym = Token.upto THEN
+        Gen.Unary (ORD(Relation1), x);
+        NextToken; expression(y); CheckSetVal(y);
+        Gen.Binary(Range, x, y)
+      ELSE
+        Gen.Unary (ORD(Singleton), x)
+      END ;
+      x.type := Symbols.setType
+    END element;
+  
+    PROCEDURE set(VAR x: Gen.Item);
+      VAR y: Gen.Item;
+    BEGIN
+      IF sym >= Token.if THEN
+        IF sym # Token.rbrace THEN Scanner.Missing(Token.rbrace) END ;
+        Gen.MakeConstItem(x, Symbols.setType, 0) (*empty set*)
+      ELSE element(x);
+        WHILE (sym < Token.rparen) OR (sym > Token.rbrace) DO
+          IF sym = Token.comma THEN NextToken
+          ELSIF sym # Token.rbrace THEN Scanner.Missing(Token.comma)
+          END ;
+          element(y); Gen.SetOp(Token.plus, x, y)
+        END
+      END
+    END set;
+
+    PROCEDURE factor(VAR x: Gen.Item);
+      VAR obj: Symbols.Object; rx: INTEGER;
+    BEGIN
+      (*sync*)
+      IF (sym < Token.char) OR (sym > Token.ident) THEN Scanner.Mark("expression expected");
+        REPEAT NextToken UNTIL (sym >= Token.char) & (sym <= Token.for) OR (sym >= Token.then)
+      END ;
+      IF sym = Token.ident THEN
+        qualident(obj);
+        IF obj.class = Symbols.SFunc THEN StandFunc(x, obj.val, obj.type)
+        ELSE
+          Gen.MakeItem(x, obj, Symbols.scopeLevel);
+          selector(x);
+          IF sym = Token.lparen THEN
+            NextToken;
+            IF (x.type.form = Symbols.Proc) & (x.type.base.form # Symbols.NoTyp) THEN
+              Gen.Unary(PrepCall,x);
+              ParamList(x);
+              Gen.Unary(Call,x);
+              x.type := x.type.base; (* inherit of return type *)
+            ELSE Scanner.Mark("not a function"); ParamList(x)
+            END
+          ELSE Gen.Unary(GetContent, x)
+          END
+        END
+      ELSIF sym = Token.int    THEN
+        IF (Scanner.ival >= LONG(0)) AND (Scanner.ival <= LONG(32767))
+        THEN Gen.MakeConstItem(x, Symbols.intType,  INT(Scanner.ival))
+        ELSE Gen.MakeLongItem (x, Scanner.ival)
+        END;
+        NextToken
+      ELSIF sym = Token.real   THEN Gen.MakeRealItem  (x, Scanner.rval); NextToken
+      ELSIF sym = Token.char   THEN Gen.MakeConstItem (x, Symbols.charType, INT(Scanner.ival)); NextToken
+      ELSIF sym = Token.nil    THEN NextToken; Gen.MakeConstItem (x, Symbols.nilType,  0)
+      ELSIF sym = Token.string THEN            Gen.MakeStringItem(x, Scanner.slen); NextToken
+      ELSIF sym = Token.lparen THEN NextToken; expression(x); Expect(Token.rparen)
+      ELSIF sym = Token.lbrace THEN NextToken; set(x); Expect(Token.rbrace)
+      ELSIF sym = Token.not    THEN NextToken; factor(x); CheckBool(x); Gen.Unary(Not, x)
+      ELSIF sym = Token.false  THEN NextToken; Gen.MakeConstItem (x, Symbols.boolType, 0)
+      ELSIF sym = Token.true   THEN NextToken; Gen.MakeConstItem (x, Symbols.boolType, 1)
+      ELSE      Scanner.Mark("not a factor");  Gen.MakeConstItem (x, Symbols.intType,  0)
+      END
+    END factor;
+
+    PROCEDURE term(VAR x: Gen.Item);
+      VAR y: Gen.Item; op, f: INTEGER;
+    BEGIN
+      factor(x); f := x.type.form;
+      WHILE (sym >= Token.times) & (sym <= Token.and) DO
+        op := sym; NextToken;
+        IF op = Token.and THEN
+          CheckBool(x); Gen.Unary (ORD(And1), x); factor(y);
+          CheckBool(y); Gen.Binary(And2, x, y)
+        ELSIF op = Token.times THEN
+          Gen.Unary(Commut1, x);
+          factor(y);
+          IF    f = Symbols.Int  THEN CheckInt (y); Gen.Binary(Mul2, x, y)
+          ELSIF f = Symbols.Long THEN CheckLong(y); Gen.Binary(Mul2, x, y)
+          ELSIF f = Symbols.Real THEN CheckReal(y); Gen.Binary(RealMul2, x, y)
+          ELSIF f = Symbols.Set  THEN CheckSet (y); Gen.SetOp(op, x, y)
+          ELSE Scanner.Mark("bad type")
+          END
+        ELSIF ORD(f) IN {Symbols.Int, Symbols.Long, Symbols.Set, Symbols.Real} THEN
+          IF f = Symbols.Set
+          THEN Gen.Unary(Commut1, x)   (* XOR is commutative *)
+          ELSE Gen.Unary(Expr1, x)
+          END;
+          factor(y);
+          IF    f = Symbols.Int  THEN CheckInt (y)
+          ELSIF f = Symbols.Long THEN CheckLong(y)
+          ELSIF f = Symbols.Real THEN CheckReal(y)
+          ELSE                        CheckSet (y)
+          END;
+          IF op = Token.div THEN
+            IF ORD(f) IN {Symbols.Int, Symbols.Long} THEN Gen.Binary(Div2, x, y)
+            ELSE Scanner.Mark("bad type")
+            END;
+          ELSIF op = Token.mod THEN
+            IF ORD(f) IN {Symbols.Int, Symbols.Long} THEN Gen.Binary(Mod2, x, y)
+            ELSE Scanner.Mark("bad type")
+            END;
+          ELSIF op = Token.rdiv THEN
+            IF    f = Symbols.Real THEN Gen.Binary(RealDiv2, x, y)
+            ELSIF f = Symbols.Set  THEN Gen.SetOp(op, x, y)
+            ELSE Scanner.Mark("bad type")
+            END
+          END
+        ELSE Scanner.Mark("bad type")
+        END
+      END
+    END term;
+
+    PROCEDURE SimpleExpression(VAR x: Gen.Item);
+      VAR y: Gen.Item; op,f: INTEGER;
+    BEGIN
+      op := sym;
+      IF (op = Token.minus) OR (op = Token.plus) THEN
+        NextToken;
+        term(x);
+        IF x.type.form IN {Symbols.Int, Symbols.Long, Symbols.Real, Symbols.Set}
+        THEN
+          IF op = Token.minus THEN Gen.Unary(Neg, x) END
+        ELSE Scanner.Mark("bad type")
+        END
+      ELSE term(x)
+      END ;
+      WHILE (sym >= Token.plus) & (sym <= Token.or) DO
+        op := sym; NextToken;
+        IF op = Token.or THEN
+          Gen.Unary(Or1, x); CheckBool(x); term(y); CheckBool(y); Gen.Binary(Or2, x, y)
+        ELSE
+          f := x.type.form;
+          IF (op = Token.minus) & (f # Symbols.Set)
+          THEN Gen.Unary(Expr1, x)
+          ELSE Gen.Unary(Commut1, x)
+          END;
+          term(y);
+          IF    f = Symbols.Int  THEN CheckInt (y)
+          ELSIF f = Symbols.Long THEN CheckLong(y)
+          ELSIF f = Symbols.Real THEN CheckReal(y)
+          ELSIF f = Symbols.Set  THEN CheckSet (y)
+          ELSE Scanner.Mark("bad type")
+          END;
+          IF ORD(f) IN {Symbols.Int, Symbols.Long} THEN
+            IF op = Token.minus THEN Gen.Binary(Sub2, x, y) ELSE Gen.Binary(Add2, x, y) END
+          ELSIF f = Symbols.Real THEN
+            IF op = Token.minus THEN Gen.Binary(RealSub2, x, y) ELSE Gen.Binary(RealAdd2, x, y) END
+          ELSE Gen.SetOp(op, x, y)
+          END
+        END
+      END
+    END SimpleExpression;
+
+  BEGIN (* expression *)
+    SimpleExpression(x);
+    IF (sym >= Token.eql) & (sym <= Token.geq) THEN
+      Gen.Unary(Relation1,x);
+      rel := sym; NextToken; SimpleExpression(y); xf := x.type.form; yf := y.type.form;
+      IF x.type = y.type THEN
+        IF (xf IN {Symbols.Char, Symbols.Int, Symbols.Long}) THEN Gen.IntRelation(rel, x, y)
+        ELSIF xf = Symbols.Real THEN Gen.RealRelation(rel, x, y)
+        ELSIF (xf IN {Symbols.Set, Symbols.Pointer, Symbols.Proc, Symbols.NilTyp, Symbols.Bool}) THEN
+          IF rel <= Token.neq THEN Gen.IntRelation(rel, x, y) ELSE Scanner.Mark("only = or #") END
+        ELSIF (xf = Symbols.Array) & (x.type.base.form = Symbols.Char) OR (xf = Symbols.String) THEN
+          Gen.StringRelation(rel, x, y)
+        ELSE Scanner.Mark("illegal comparison")
+        END
+      ELSIF (xf IN {Symbols.Pointer, Symbols.Proc}) & (yf = Symbols.NilTyp)
+          OR (yf IN {Symbols.Pointer, Symbols.Proc}) & (xf = Symbols.NilTyp) THEN
+        IF rel <= Token.neq THEN Gen.IntRelation(rel, x,  y) ELSE Scanner.Mark("only = or #") END
+      ELSIF (xf = Symbols.Pointer) & (yf = Symbols.Pointer) &
+          (IsExtension(x.type.base, y.type.base) OR IsExtension(y.type.base, x.type.base))
+          OR (xf = Symbols.Proc) & (yf = Symbols.Proc) & EqualSignatures(x.type, y.type) THEN
+        IF rel <= Token.neq THEN Gen.IntRelation(rel,  x, y) ELSE Scanner.Mark("only = or #") END
+      ELSIF (xf = Symbols.Array) & (x.type.base.form = Symbols.Char) &
+            ((yf = Symbols.String) OR (yf = Symbols.Array) & (y.type.base.form = Symbols.Char))
+          OR (yf = Symbols.Array) & (y.type.base.form = Symbols.Char) & (xf = Symbols.String) THEN
+        Gen.StringRelation(rel, x, y)
+      ELSIF (xf = Symbols.Char) & (yf = Symbols.String) & (y.b = 1) THEN
+        Gen.Unary(StrToChar, y); Gen.IntRelation(rel, x, y)
+      ELSIF (yf = Symbols.Char) & (xf = Symbols.String) & (x.b = 1) THEN
+        Gen.Unary(StrToChar, x); Gen.IntRelation(rel, x, y)
+      ELSIF (xf = Symbols.Int) & (yf = Symbols.Int) THEN Gen.IntRelation(rel,  x, y)  (*BYTE*)
+      ELSE Scanner.Mark("incompatible types")
+      END ;
+      x.type := Symbols.boolType
+    ELSIF sym = Token.in THEN
+      NextToken;
+      CheckInt(x); Gen.Unary(Relation1, x);
+      SimpleExpression(y); CheckSet(y); Gen.Binary(In, x, y) ;
+      x.type := Symbols.boolType
+    ELSIF sym = Token.is THEN
+      NextToken; qualident(obj); TypeTest(x, obj.type, FALSE) ;
+      x.type := Symbols.boolType
+    END
+  END expression;
+
+BEGIN
+  expressionProc := expression
+END Expressions.
+

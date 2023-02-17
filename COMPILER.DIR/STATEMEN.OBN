@@ -1,0 +1,343 @@
+MODULE Statements; (*N. Wirth 1.7.97 / 8.3.2020  Oberon compiler *)
+  IMPORT SYSTEM, Token, Scanner, Symbols, Gen := Gen2, Expressions, Terminal;
+  (*Author: Niklaus Wirth, 2014.
+    Parser of Oberon compiler. Uses Scanner to obtain symbols (tokens),
+    SymTab for definition of data structures and for handling import and export, and
+    GenCode to produce binary code. Parser performs type checking and data allocation.
+    Parser is target-independent, except for part of the handling of allocations.*)
+
+(* $[+ remove procedure names *)
+(* $O- remove overflow checks *)
+(* $T- remove tests *)
+
+  CONST
+    DEBUG = FALSE;
+
+    (* Unary gencode ops *)
+    DeRef=1; Not=2; And1=3; Or1=4; Neg=5; Singleton=6; StrToChar=7;
+    OpenArrayParam=8; Dispose=9; StringParam=10; For1a=11; Cap=12;
+    GetContent=13; New=14; Call=15; PrepCall=16; Abs=17; Odd=18; Floor=19;
+    Float=20; Ord=21; Len=22; Chr=23; Get=24; Adr=25; GetCarry=26;
+    Store1=27; Commut1=28; Expr1=29; Relation1=30; Index1=31; Int2Long=32; Long2Int=33;
+    Mark=34; Release=35; FreeMem=36; Lsw=37; Msw=38; Halt=39; Assert=40;
+
+    (* Binary gencode ops *)
+    Index2=1; Add2=2; Sub2=3; Div2=4; Mod2=5; And2=6; Or2=7; Mul2=8;
+    RealAdd2=9; RealSub2=10; RealMul2=11; RealDiv2=12; Range=13; In=14; Store2=15;
+    StoreStruct=16; CopyString=17; For0=18; For1b=19; For2=20; Increment=21; Put=22;
+    ADDC=23; SUBC=24; MULC=25; DIVC=26; SYS=27;
+    Include=28; Exclude=29; Allocate=30; Dealloc=31; PackLong=32;
+
+  VAR sym : INTEGER; (* copy of last symbol read *)
+
+  PROCEDURE NextToken; BEGIN Expressions.NextToken; sym := Scanner.token END NextToken;
+
+  PROCEDURE Expect(s: INTEGER);
+  BEGIN
+    IF Scanner.token = s THEN NextToken ELSE Scanner.Missing(s) END
+  END Expect;
+
+  PROCEDURE StatSequence*;
+    VAR obj: Symbols.Object;
+      x, y, z, w: Gen.Item;
+      loopStart, condJump, loopJump, condList, endList: INTEGER;
+
+    PROCEDURE StandProc(pno: INTEGER);
+      VAR nap, npar: INTEGER; (*nof actual/formal parameters*)
+        x, y, z: Gen.Item;
+    BEGIN
+      npar := pno MOD 10; pno := pno DIV 10;
+      nap := 0;
+      IF npar >= 1 THEN
+        Expect(Token.lparen);
+        Expressions.expression(x);
+        IF     pno >= 12 THEN Gen.ValueParam(x, Symbols.intType)
+        ELSIF (pno >= 4) & (pno <= 9) THEN Gen. VarParam(x, x.type)
+        END;
+        nap := 1;
+        IF Scanner.token = Token.comma THEN
+          NextToken;
+          Expressions.expression(y);
+          IF pno >= 4 THEN Gen.ValueParam(y, Symbols.intType) END;
+          nap := 2; z.type := Symbols.noType;
+          WHILE Scanner.token = Token.comma DO
+            NextToken;
+            Expressions.expression(z); Gen.ValueParam(z, Symbols.intType);
+            INC(nap)
+          END
+        ELSE y.type := Symbols.noType
+        END ;
+        Expect(Token.rparen);
+      END;
+      IF (npar = nap) OR (pno < 2) THEN
+        IF   (pno < 2) THEN (* INC or DEC *)
+          Expressions.CheckInt(x);
+          Expressions.CheckWritable(x);
+          IF y.type = Symbols.noType
+          THEN y.a := Symbols.Const; y.a := 1
+          ELSE Expressions.CheckInt(y); Expressions.CheckConst(y)
+          END ;
+          IF pno # 0 THEN y.a := -y.a END;
+          Gen.Binary(Increment, x, y)
+        ELSIF pno = 2 THEN (*INCL*)
+          Expressions.CheckSet(x); Expressions.CheckWritable(x);
+          Expressions.CheckInt(y); Expressions.CheckConst(y); Gen.Binary(Include, x, y)
+        ELSIF pno = 3 THEN (*EXCL*)
+          Expressions.CheckSet(x); Expressions.CheckWritable(x); Expressions.CheckInt(y); Expressions.CheckConst(y); Gen.Binary(Exclude, x, y)
+        ELSIF pno <= 7 THEN (*NEW/DISPOSE/ALLOCATE/DEALLOCATE*)
+            Expressions.CheckWritable(x); IF pno >= 6 THEN Expressions.CheckInt(y) END;
+            IF x.type^.form = Symbols.Pointer THEN
+              IF    pno = 4 THEN Gen.Unary (ORD(New), x)
+              ELSIF pno = 5 THEN Gen.Unary (ORD(Dispose), x)
+              ELSIF pno = 6 THEN Gen.Binary(Allocate, x, y)
+              ELSE               Gen.Binary(Dealloc,  x, y)
+              END
+            ELSE Scanner.Mark("not a pointer")
+            END
+        ELSIF pno =  8 THEN (* MARK *) Expressions.CheckInt(x); Gen.Unary(Mark, x)
+        ELSIF pno =  9 THEN (*RELEASE*)Expressions.CheckInt(x); Gen.Unary(Release, x)
+        ELSIF pno = 10 THEN (* CLC *) Gen.ClearCarry
+        ELSIF pno = 11 THEN (* ASSERT *)
+          Expressions.CheckBool(x); Gen.Unary(Assert, x)
+        ELSIF pno = 12 THEN (* PUT  *) Expressions.CheckInt(x); Gen.Binary(Put, x, y)
+        ELSIF pno = 13 THEN (* COPY *) Expressions.CheckInt(x); Expressions.CheckInt(y); Expressions.CheckInt(z); Gen.Copy
+        ELSIF pno = 14 THEN (* FILL *) Expressions.CheckInt(x); Expressions.CheckInt(y); Expressions.CheckInt(z); Gen.Fill
+        ELSIF pno = 25 THEN (* HALT *) Gen.Unary(Halt, x)
+        END
+      ELSE Scanner.Mark("wrong nof parameters")
+      END
+    END StandProc;
+
+    PROCEDURE TypeCase(caseVar: Symbols.Object; VAR condList: INTEGER);
+      VAR typobj,varCopy : Symbols.Object;
+          x      : Gen.Item;
+    BEGIN
+      Gen.MakeItem(x, caseVar, Symbols.scopeLevel);
+      IF Scanner.token = Token.ident THEN
+        Expressions.qualident(typobj);
+        IF typobj.class # Symbols.Typ THEN Scanner.Mark("not a type") END ;
+        Expressions.TypeTest(x, typobj.type, FALSE);
+        Symbols.OpenScope;       (* open a new scope for the "copy" of the variable... *)
+        Symbols.NewObj(varCopy, caseVar.name, caseVar.class);
+        varCopy.class:= caseVar.class;
+        varCopy.expo := caseVar.expo;
+        varCopy.type := typobj.type; (* the variable inherits the selected CASE type *)
+        varCopy.rdo  := caseVar.rdo;
+        varCopy.lev  := caseVar.lev;
+        varCopy.val  := caseVar.val;
+        varCopy.extension := caseVar.extension;
+        Gen.FJump(condList, TRUE);
+        Expect(Token.colon);
+        StatSequence;
+        Symbols.CloseScope;      (* ... for the duration of the selected CASE *)
+      ELSE Gen.FJump(condList, TRUE); Scanner.Mark("type id expected")
+      END
+     END TypeCase;
+
+    PROCEDURE TableCase(obj: Symbols.Object);
+    VAR jumpArray: ARRAY 256 OF INTEGER;
+        x: Gen.Item;
+        caseJump: INTEGER;
+    BEGIN
+      Gen.MakeItem(x, obj, Symbols.scopeLevel);
+      Gen.Unary(Expr1, x);
+      Gen.FJump(caseJump, FALSE);
+      WHILE Scanner.token = Token.bar DO
+        NextToken;
+        Expressions.expression(x);
+        IF (x.type = Symbols.strType) & (x.b = 1) THEN
+          Gen.Unary(StrToChar, x)
+        END;
+        Expressions.CheckConst(x);
+        IF x.type.form # obj.type.form THEN Scanner.Mark("bad type") END;
+        IF (x.a >= 0) & (x.a <= 255)
+        THEN jumpArray[x.a] := Gen.Here()
+        ELSE Scanner.Mark("byte value only")
+        END;
+        Expect(Token.colon);
+        StatSequence;
+        Gen.EndCase
+      END;
+      Gen.JumpTable(caseJump, jumpArray)
+    END TableCase;
+
+  BEGIN (* StatSequence *)
+    REPEAT
+      obj := NIL;
+      sym := Scanner.token;
+      (* sync *)
+      IF NOT((sym >= Token.ident) & (sym <= Token.return) OR (sym >= Token.semicolon)) THEN
+        Scanner.Mark("statement expected");
+        REPEAT NextToken UNTIL (sym >= Token.ident)
+      END ;
+      IF sym = Token.ident THEN
+        Expressions.qualident(obj); Gen.MakeItem(x, obj, Symbols.scopeLevel);
+        IF x.mode = Symbols.SProc THEN StandProc(obj.val)
+        ELSE
+          Expressions.selector(x);
+          sym := Scanner.token;
+
+          IF sym = Token.becomes THEN (*assignment*)
+            NextToken;
+            Expressions.CheckWritable(x);
+            Gen.Unary(Store1, x);
+            Expressions.expression(y);
+            IF Expressions.CompTypes(x.type, y.type, FALSE) THEN
+              IF (x.type.form <= Symbols.Pointer) OR (x.type.form = Symbols.Proc)
+              THEN Gen.Binary(Store2, x, y)
+              ELSE Gen.Binary(StoreStruct, x, y)
+              END
+            ELSIF (x.type.form = Symbols.Array)
+                & (y.type.form = Symbols.Array)
+                & (x.type.base = y.type.base)
+                & (y.type.len  < 0) THEN
+              Gen.Binary(StoreStruct, x, y)
+            ELSIF (x.type.form = Symbols.Array)
+                & (x.type.base.form = Symbols.Char)
+                & (y.type.form = Symbols.String) THEN
+              Gen.Binary(CopyString, x, y)
+            ELSIF (x.type.form = Symbols.Int)
+                & (y.type.form = Symbols.Int) THEN
+              Gen.Binary(Store2, x, y)  (*BYTE*)
+            ELSIF (x.type.form = Symbols.Char)
+                & (y.type.form = Symbols.String)
+                & (y.b = 1) THEN
+              Gen.Unary(StrToChar, y); Gen.Binary(Store2, x, y)
+            ELSE
+              Scanner.Mark("illegal assignment")
+            END
+          ELSIF sym = Token.eql THEN
+            Scanner.Mark("should be :="); NextToken; Expressions.expression(y)
+          ELSIF sym = Token.lparen THEN (*procedure call*)
+            NextToken;
+            IF (x.type.form = Symbols.Proc)
+             & (x.type.base.form = Symbols.NoTyp) THEN
+              Gen.Unary(PrepCall,x); Expressions.ParamList(x); Gen.Unary(Call,x)
+            ELSE Scanner.Mark("not a procedure"); Expressions.ParamList(x)
+            END
+          ELSIF x.type.form = Symbols.Proc THEN (*procedure call without parameters*)
+            IF x.type.nofpar > 0 THEN Scanner.Mark("missing parameters") END ;
+            IF x.type.base.form = Symbols.NoTyp
+            THEN Gen.Unary(PrepCall,x); Gen.Unary(Call,x)
+            ELSE Scanner.Mark("not a procedure")
+            END
+          ELSIF x.mode = Symbols.Typ THEN Scanner.Mark("illegal assignment")
+          ELSE Scanner.Mark("not a procedure")
+          END
+        END
+
+      ELSIF Scanner.extensions & (sym = Token.return) THEN
+        NextToken;
+        IF Symbols.currentProcType.base # Symbols.noType THEN
+          Expressions.expression(x);
+          IF NOT Expressions.CompTypes(Symbols.currentProcType.base, x.type, FALSE) THEN
+            Scanner.Mark("wrong result type")
+          END
+        END;
+        Gen.Return(Symbols.currentProcType.base.form, x, Symbols.paramBlockSize);
+
+      ELSIF sym = Token.if THEN
+        endList  := 0; (* end of branch links list *)
+        condList := 0; (* end of conditional jumps list *)
+        NextToken;
+        Expressions.expression(x); Expressions.CheckBool(x); Gen.Unary(Expr1, x);
+        Gen.FJump(condList, TRUE);    (* chainlink the conditional jumps *)
+        Expect(Token.then);
+        StatSequence;
+        WHILE sym = Token.elsif DO
+          NextToken;
+          Gen.FJump(endList, FALSE);  (* chain the jumps-to-the-end *)
+          Expressions.expression(x); Expressions.CheckBool(x); Gen.Unary(Expr1, x);
+          Gen.FJump(condList, TRUE);
+          Expect(Token.then);
+          StatSequence
+        END ;
+        IF sym = Token.else THEN
+          NextToken;
+          Gen.FJump(endList, FALSE);
+          StatSequence
+        END ;
+        Expect(Token.end);
+        Gen.FixBranchLists(condList, endList);
+
+      ELSIF sym = Token.while THEN
+        loopStart := Gen.Here();
+        REPEAT
+          NextToken;
+          Expressions.expression(x); Expressions.CheckBool(x); Gen.Unary(Expr1, x);
+          Gen.FJump(condJump, TRUE);
+          Expect(Token.do);
+          StatSequence;
+          loopJump := Gen.Here();
+          Gen.BJump(loopStart, FALSE);
+          Gen.Fixup2(condJump, loopJump);
+        UNTIL sym # Token.elsif;
+        Expect(Token.end)
+
+      ELSIF sym = Token.repeat THEN
+        NextToken; loopStart := Gen.Here(); StatSequence;
+        IF sym = Token.until THEN
+          NextToken; Expressions.expression(x); Expressions.CheckBool(x); Gen.Unary(Expr1, x);
+          Gen.BJump(loopStart, TRUE)
+        ELSE Scanner.Missing(Token.until)
+        END
+
+      ELSIF sym = Token.for THEN
+        NextToken;
+        IF sym = Token.ident THEN
+          Expressions.qualident(obj); Gen.MakeItem(x, obj, Symbols.scopeLevel);
+          Expressions.CheckInt(x);
+          Expressions.CheckWritable(x);
+          IF Scanner.token = Token.becomes THEN
+            NextToken; Expressions.expression(y); Expressions.CheckInt(y);
+            Gen.Binary(For0, x, y); (* loop variable initialization *)
+            Expect(Token.to); Expressions.expression(z); Expressions.CheckInt(z);
+            Gen.Unary(Expr1, z); (* leave the limit on stack *)
+            obj.rdo := TRUE;     (* loop variable is readonly inside the loop *)
+            IF Scanner.token = Token.by
+            THEN NextToken; Expressions.expression(w); Expressions.CheckConst(w); Expressions.CheckInt(w)
+            ELSE Gen.MakeConstItem(w, Symbols.intType, 1)
+            END ;
+            loopJump := 0;
+            Gen.FJump(loopJump, FALSE); (* a forward jump to the test *)
+            loopStart := Gen.Here();
+            Expect(Token.do);
+            StatSequence;
+            Gen.Binary(For2, x, w);     (* increment the loop variable *)
+            Gen.Fixup1(loopJump);       (* fix the forward jump *)
+            Gen.For3(x, w, loopStart);  (* compare the x var with the stacked limit *)
+            Expect(Token.end);
+            obj.rdo := FALSE            (* loop variable is writable outside the loop *)
+          ELSE Scanner.Missing(Token.becomes)
+          END
+        ELSE Scanner.Missing(Token.ident)
+        END
+
+      ELSIF sym = Token.case THEN
+        NextToken; Expressions.qualident(obj);
+        Expect(Token.of);
+        IF    (obj.type = Symbols.intType)
+           OR (obj.type = Symbols.charType) THEN TableCase(obj)
+        ELSIF (obj.type.form = Symbols.Pointer)
+           OR (obj.type.form = Symbols.Record) THEN
+          condList := 0; endList := 0;
+          WHILE sym = Token.bar DO
+            NextToken;
+            TypeCase(obj, condList);
+            Gen.FJump(endList, FALSE);
+          END ;
+          Gen.FixBranchLists(condList, endList);
+        ELSE Scanner.Mark("variable expected")
+        END ;
+        Expect(Token.end)
+      END ;
+
+      (* statements are separated by semi-colons *)
+      sym := Scanner.token;
+      IF sym = Token.semicolon THEN NextToken
+      ELSIF (sym < Token.semicolon) & (sym # Token.return) THEN Scanner.Missing(Token.semicolon)
+      END
+    UNTIL (sym > Token.semicolon) OR (sym = Token.return) & NOT Scanner.extensions
+  END StatSequence;
+
+END Statements.

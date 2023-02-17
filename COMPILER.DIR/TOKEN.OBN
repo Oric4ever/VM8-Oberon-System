@@ -1,0 +1,88 @@
+MODULE Token;
+  CONST
+    null*  = 0;
+    (* multiplicative operators *)
+    times* = 1;
+    rdiv*  = 2;
+    div*   = 3;
+    mod*   = 4;
+    and*   = 6;
+    (* additive operators *)
+    plus*  = 7;
+    minus* = 8;
+    or*    = 9;
+    (* relational operators *)
+    eql*   = 10;
+    neq*   = 11;
+    lss*   = 12;
+    gtr*   = 13;
+    leq*   = 14;
+    geq*   = 15;
+    in*    = 16;
+    is*    = 17;
+    (* selector operators *)
+    arrow*  = 18;
+    period* = 19;
+    (* litteral strings and numbers *)
+    char*   = 20;
+    int*    = 21;
+    real*   = 22;
+    (* named constants *)
+    false*  = 23;
+    true*   = 24;
+    nil*    = 25;
+    string* = 26;
+    not*    = 27;
+    (* opening chars *)
+    lparen* = 28;
+    lbrak*  = 29;
+    lbrace* = 30;
+    (* identifiers that are not Oberon keywords *)
+    ident*  = 31;
+    (* control structures *)
+    if*     = 32;
+    while*  = 34;
+    repeat* = 35;
+    case*   = 36;
+    for*    = 37;
+    (* statements *)
+    return* = 38;
+    (* syntactic sugar *)
+    comma*  = 40;
+    colon*  = 41;
+    becomes*= 42;
+    upto*   = 43;
+    (* closing chars *)
+    rparen* = 44;
+    rbrak*  = 45;
+    rbrace* = 46;
+    (* syntax sugar *)
+    then*   = 47;
+    of*     = 48;
+    do*     = 49;
+    to*     = 50;
+    by*     = 51;
+    (* separators and ends *)
+    semicolon* = 52;
+    end*    = 53;
+    bar*    = 54;
+    (* delimiters in control structures *)
+    else*   = 55;
+    elsif*  = 56;
+    until*  = 57;
+    (* type constructors *)
+    array*  = 60;
+    record* = 61;
+    pointer*= 62;
+    (* declaration keywords *)
+    const*  = 63;
+    type*   = 64;
+    var*    = 65;
+    procedure* = 66;
+    begin*  = 67;
+    import* = 68;
+    module* = 69;
+    tagged* = 70;
+    (* end of file *)
+    eot*    = 71;
+END Token.
