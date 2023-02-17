@@ -1,0 +1,307 @@
+MODULE Loader;
+IMPORT SYSTEM, Terminal, Disk, FAT32, DIR32;
+
+CONST TRACE     = FALSE;
+      NBPATHS   = 16;
+      CHAINFLAG = 8;
+
+(* $X+ uses multiple RETURNs *)
+
+TYPE
+     ADDRESS    = INTEGER;
+     Record     = RECORD END;
+     AllocPtr   = POINTER TO Record;
+     ModuleName = ARRAY  8 OF CHAR;␍
+     Header     = RECORD␍
+                    fileSize, moduleAddr, codeSize, nbDependencies: INTEGER;␍
+                    reserved: ARRAY 4 OF INTEGER␍
+                  END;␍
+     Dependency = RECORD␍
+                    name    : ModuleName;␍
+                    version : INTEGER;␍
+                    location: INTEGER;␍
+                  END;␍
+     ModulePtr  = POINTER TO ModuleDesc;
+     ModuleDesc = RECORD␍
+                    dependencies: ARRAY 32 OF ADDRESS;␍
+                    link        : ModulePtr;␍
+                    name        : ModuleName;␍
+                    reserved1   : INTEGER;␍
+                    version     : INTEGER;␍
+                    procTable   : ADDRESS;␍
+                    flags       : BYTE;␍
+                    nbOfVars    : BYTE;␍
+                    reserved2,␍
+                    nbDependencies: BYTE;␍
+                    vars        : ARRAY 126 OF INTEGER;
+                  END;␍
+     ModuleRider= RECORD
+                    index       : INTEGER;       (* index in buffer *)
+                    cluster     : FAT32.Cluster; (* current cluster *)
+                    fragment    : INTEGER;       (* current fragment *)
+                    buffer      : Disk.Sector;   (* buffer for current fragment (sector) *)
+                  END;
+
+VAR module1*    : ModulePtr;
+    nbDirPaths  : INTEGER;
+    dirPaths    : ARRAY NBPATHS OF DIR32.Directory;
+
+    initLast    : ModulePtr;   (* last of list of modules to init *)
+    loadSuccess : BOOLEAN;
+    initProc    : PROCEDURE;
+
+PROCEDURE MemWord(addr: ADDRESS): INTEGER; (* LSL avoids overflow *)
+BEGIN RETURN SYSTEM.GET(addr) + LSL(SYSTEM.GET(addr+1), 8)
+END MemWord;
+
+PROCEDURE SetWord(addr: ADDRESS; value: INTEGER);
+BEGIN
+  SYSTEM.PUT(addr  , value MOD 256);
+  SYSTEM.PUT(addr+1, value DIV 256);
+END SetWord;
+
+PROCEDURE SearchInPath*(VAR entry: DIR32.Entry; name: ARRAY OF CHAR): BOOLEAN;
+VAR i, n: INTEGER;
+BEGIN
+  DIR32.Build83Name(name, entry.desc.nameAndType);
+
+  (* try first in current directory *)
+  DIR32.InitFind(entry.desc.nameAndType);
+  IF DIR32.FindNextMatch(entry) THEN RETURN TRUE END;
+
+  (* otherwise try in libraries *)
+  DIR32.SaveCurrentDir;
+  FOR n := 0 TO nbDirPaths-1 DO
+    DIR32.SetCurrentDir( dirPaths[n] );
+    DIR32.InitFind(entry.desc.nameAndType);
+    IF DIR32.FindNextMatch(entry) THEN DIR32.BackToSavedDir; RETURN TRUE END;
+  END;
+  DIR32.BackToSavedDir;
+  RETURN FALSE
+END SearchInPath;
+
+
+PROCEDURE ReadBytes(VAR rider: ModuleRider; addr, nbBytes: INTEGER);
+VAR bytesToCopy: INTEGER;
+BEGIN
+  bytesToCopy := 512 - rider.index;
+  IF bytesToCopy > nbBytes THEN bytesToCopy := nbBytes END;
+  SYSTEM.COPY(SYSTEM.ADR(rider.buffer.data[rider.index]), addr, bytesToCopy);
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+  addr        := addr        + bytesToCopy;
+(* $O+ *)
+  nbBytes     := nbBytes     - bytesToCopy;
+  rider.index := rider.index + bytesToCopy;
+  WHILE nbBytes > 0 DO
+    IF FAT32.NextSector(rider.cluster, rider.fragment, FALSE) THEN
+      FAT32.ReadFragment(rider.cluster, rider.fragment, rider.buffer)
+    END;
+    bytesToCopy := 512; IF nbBytes < bytesToCopy THEN bytesToCopy := nbBytes END;
+    SYSTEM.COPY(SYSTEM.ADR(rider.buffer), addr, bytesToCopy);
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+    addr    := addr    + bytesToCopy;
+(* $O+ *)
+    nbBytes := nbBytes - bytesToCopy;
+    rider.index := bytesToCopy;
+  END
+END ReadBytes;
+
+PROCEDURE LoadWithDependencies(
+                          modName         : ARRAY OF CHAR;
+                          referencer      : ModuleName;
+                          requiredVersion : INTEGER;
+                          VAR moduleAddr  : ADDRESS
+                         );
+
+VAR loadedModule  : ModulePtr;
+    module        : ModulePtr;
+    filename      : ARRAY 16 OF CHAR;
+    entry         : DIR32.Entry;
+    rider         : ModuleRider;
+    header        : Header;
+    i             : INTEGER;
+    varCount, varSize : INTEGER;
+    origin        : INTEGER;   (* base address of the module *)
+    allocAddr     : AllocPtr;
+    dependencySize: INTEGER;
+    dependencies  : ARRAY 32 OF Dependency;
+    dependModAddr : ADDRESS;
+BEGIN
+  (* check first if module is already in loaded module chain *)
+  module := module1;
+  WHILE (module # NIL) AND (module.name # modName) DO module := module.link END;
+
+  IF module # NIL THEN moduleAddr := ORD(module) + 80
+  ELSE
+
+    (* not found => build a .MCD filename and search in directory path *)
+    filename := modName;
+    i := 0; WHILE filename[i] # 0X DO INC(i) END;
+    filename[i  ] := '.';
+    filename[i+1] := 'M';
+    filename[i+2] := 'C';
+    filename[i+3] := 'D';
+    filename[i+4] :=  0X;
+    IF NOT SearchInPath(entry, filename) THEN
+      Terminal.String("Cannot find ");
+      Terminal.String(modName);
+      Terminal.Ln;
+      loadSuccess := FALSE;
+      RETURN
+    END;
+
+    (* .MCD file has been found, load its header *)
+    rider.cluster  := LONG(entry.desc.highCluster, entry.desc.startCluster);
+    FAT32.ReadFragment(rider.cluster, rider.fragment, rider.buffer);
+    ReadBytes(rider, SYSTEM.ADR(header), 16);
+
+    (* then load the code (and module descriptor) *)
+    SYSTEM.ALLOCATE(allocAddr, header.codeSize);
+    origin := SYSTEM.VAL(ADDRESS, allocAddr);
+    ReadBytes(rider, origin, header.codeSize);
+
+    (* also load the dependencies table *)
+    dependencySize := header.nbDependencies * 12;
+    ReadBytes(rider, SYSTEM.ADR(dependencies), dependencySize);
+
+    (* translate the procedure table address *)
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+    moduleAddr       := header.moduleAddr + origin;
+    module           := SYSTEM.VAL(ModulePtr, moduleAddr);
+    module.procTable := module.procTable + origin;
+(* $O+ *)
+
+    (* allocate the arrays and records *)
+    varCount      := ORD(module.nbOfVars);
+    WHILE varCount # 0 DO
+      DEC(varCount);
+      varSize := module.vars[varCount];
+      IF varSize # 0 THEN
+        SYSTEM.ALLOCATE(allocAddr, varSize);
+        module.vars[varCount] := SYSTEM.VAL(ADDRESS, allocAddr)
+      END;
+    END;
+
+    module.flags := module.flags + CHAINFLAG;  (* mark the module to include in chain *)
+    module.link  := module1;  (* for now, new modules are inserted before old ones *)
+    module1      := module;
+    INC(moduleAddr, 80);
+    FOR i := 0 TO header.nbDependencies-1 DO
+      LoadWithDependencies(dependencies[i].name, module.name, dependencies[i].version, dependModAddr);
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+      SetWord(dependencies[i].location + origin, dependModAddr);
+(* $O+ *)
+    END
+  END;
+  IF (requiredVersion # 0) AND (module.version # requiredVersion) THEN
+    Terminal.String("Version conflict between ");
+    Terminal.String(modName);
+    Terminal.String(" and ");
+    Terminal.String(referencer);
+    Terminal.Ln;
+    loadSuccess := FALSE;
+    RETURN
+  END;
+END LoadWithDependencies;
+
+PROCEDURE ChainModule(moduleAddr: ADDRESS);
+VAR i: INTEGER;
+    dependencyModule : ADDRESS;
+    module : ModulePtr;
+BEGIN
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+  module := SYSTEM.VAL(ModulePtr, moduleAddr-80);
+(* $O+ *)
+  module.flags := module.flags - CHAINFLAG;
+(* dependency modules have to come first in the chain of initialization *)
+  FOR i := 0 TO 1 - ORD(module.nbDependencies) BY -1 DO
+    dependencyModule := module.dependencies[i+31];
+    IF (dependencyModule # 0) AND (SYSTEM.GET(dependencyModule) >= CHAINFLAG) THEN
+      ChainModule(dependencyModule)
+    END;
+  END;
+(* append the module at end of list of modules to init *)
+  IF initLast = NIL THEN module1 := module (* first module to init *)
+  ELSE initLast.link := module
+  END;
+  initLast := module;
+END ChainModule;
+
+PROCEDURE Call*(name: ARRAY OF CHAR): BOOLEAN;
+VAR module         : ModulePtr;
+    oldFirstModule : ModulePtr;
+    modName        : ModuleName;
+    moduleAddr     : ADDRESS;
+    saveHeapAddr   : ADDRESS;
+    i              : INTEGER;
+BEGIN
+  modName        := name;
+  FOR i := 0 TO LEN(modName)-1 DO modName[i] := CAP(modName[i]) END;
+  loadSuccess    := TRUE;
+  oldFirstModule := module1;
+  SYSTEM.MARK(saveHeapAddr);
+
+  LoadWithDependencies(modName, modName, 0, moduleAddr);
+
+  IF loadSuccess THEN
+    initLast := NIL; ChainModule(moduleAddr);
+
+    (* init all the loaded modules *)
+    module := module1;
+    WHILE module # oldFirstModule DO
+(* $O- don't check overflows, addresses might cross 7FFFH barrier *)
+      SetWord(SYSTEM.ADR(initProc), SYSTEM.VAL(INTEGER, module)+80 );
+(* $O+ *)
+      initProc();
+      module := module.link;
+    END;
+  END;
+
+  (* clean memory after the called module has been run *)
+  SYSTEM.RELEASE(saveHeapAddr);
+  module1    := oldFirstModule;
+  RETURN loadSuccess
+END Call;
+
+(* $O+ check overflows, no more address calculation below this point *)
+
+PROCEDURE InitPath;
+VAR i           : INTEGER;
+    entry       : DIR32.Entry;
+    dirname     : ARRAY 9 OF CHAR;
+    startCluster: FAT32.Cluster;
+    buffer      : Disk.Sector;
+    bufIndex    : INTEGER;
+BEGIN
+  DIR32.SaveCurrentDir;
+  DIR32.EnterRootDir;
+  entry.desc.nameAndType.baseName  := "LOADPATH";
+  entry.desc.nameAndType.extension := "TXT";
+  DIR32.InitFind(entry.desc.nameAndType);
+  IF DIR32.FindNextMatch(entry) THEN
+    startCluster := LONG(entry.desc.highCluster, entry.desc.startCluster);
+    FAT32.ReadFragment(startCluster, 0, buffer);
+    nbDirPaths := 0;
+    bufIndex   := 0;
+    WHILE (nbDirPaths <= 15) & (ORD(buffer.data[bufIndex]) > 20H) DO
+      i := 0;
+      WHILE ORD(buffer.data[bufIndex]) # ORD(':') DO
+        IF i < 8 THEN dirname[i] := CHR(ORD(buffer.data[bufIndex])); INC(i) END;
+        INC(bufIndex);
+      END;
+      dirname[i] := 0X;
+      IF DIR32.EnterDir(dirname) THEN
+        dirPaths[nbDirPaths] := DIR32.CurrentDir();
+        DIR32.EnterRootDir;
+        INC(nbDirPaths);
+      END;
+      INC(bufIndex);
+    END;
+  END;
+  DIR32.BackToSavedDir;
+END InitPath;
+
+BEGIN
+  module1 := SYSTEM.VAL(ModulePtr, MemWord(030CH));
+  InitPath;
+END Loader.

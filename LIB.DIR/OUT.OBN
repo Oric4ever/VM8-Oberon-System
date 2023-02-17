@@ -1,0 +1,23 @@
+MODULE Out;
+IMPORT Streams, Print;
+VAR out: Streams.OutputStream;
+
+PROCEDURE Open*; (* for compliance with Oakwood Guidelines for Oberon 2 *)
+BEGIN END Open;
+
+PROCEDURE Char*  (ch: CHAR);              BEGIN Print.Char  (out, ch)   END Char;
+PROCEDURE String*(s: ARRAY OF CHAR);      BEGIN Print.String(out, s)    END String;
+PROCEDURE Int*   (i,n: INTEGER);          BEGIN Print.Int   (out, i, n) END Int;
+PROCEDURE Long*  (l: LONGINT; n: INTEGER);BEGIN Print.Long  (out, l, n) END Long;
+PROCEDURE Real*  (x: REAL   ; n: INTEGER);BEGIN Print.Real  (out, x, n) END Real;
+PROCEDURE Ln*;                            BEGIN Print.Ln    (out)       END Ln;
+
+PROCEDURE Close*; (* make sure data is written out *)
+BEGIN Streams.Close(out)
+END Close;
+
+BEGIN
+  out := Streams.output
+END Out.
+
+

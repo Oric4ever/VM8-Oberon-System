@@ -1,0 +1,146 @@
+MODULE Terminal;
+IMPORT SYSTEM;
+CONST
+    NUL=0; BACKSP=8; TAB=9; LF=0AH; CR=0DH; CANCEL=18H; ESC=1BH; DEL=7FH;
+    CONSTAT = 1; CONIN = 2; CONOUT = 3;
+
+(* $O- remove overflow tests *)
+(* $T- remove tests *)
+
+VAR numRows*, numCols* : INTEGER;
+
+PROCEDURE Char*(ch: CHAR);
+VAR dummy: INTEGER;
+BEGIN
+  dummy := SYSTEM.SYS(CONOUT, ORD(ch))
+END Char;
+
+PROCEDURE Ln*; BEGIN Char(CHR(CR)); Char(CHR(LF)) END Ln;
+
+PROCEDURE String*(s: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+  i := 0; WHILE (i < LEN(s)) AND (ORD(s[i]) # NUL) DO Char(s[i]); INC(i) END
+END String;
+
+PROCEDURE Num*(n: INTEGER);
+(* Write positive integers only *)
+BEGIN
+  IF n >= 10 THEN Num(n DIV 10) END;
+  Char(CHR(n MOD 10 + ORD('0')))
+END Num;
+
+PROCEDURE GotoXY*(col,row: INTEGER);
+BEGIN
+  Char(CHR(ESC));
+  Char('['); Num(row+1);
+  Char(';'); Num(col+1);
+  Char('H');
+END GotoXY;
+
+PROCEDURE CSI(command: CHAR);
+BEGIN
+  Char(CHR(ESC)); Char('['); Char(command)
+END CSI;
+
+PROCEDURE Background*(color: INTEGER);
+BEGIN
+  CSI('4'); Char(CHR( ORD('0') + color )); Char('m')
+END Background;
+
+PROCEDURE Foreground*(color: INTEGER);
+BEGIN
+  CSI('3'); Char(CHR( ORD('0') + color )); Char('m')
+END Foreground;
+
+PROCEDURE Home*;        BEGIN CSI('H')                     END Home;
+PROCEDURE ClearScreen*; BEGIN Home; CSI('J')               END ClearScreen;
+PROCEDURE Highlight*;   BEGIN CSI('1'); Char('m')          END Highlight;
+PROCEDURE Normal*;      BEGIN CSI('m')                     END Normal;
+PROCEDURE CursorOff*;   BEGIN CSI('?'); Num(25); Char('l') END CursorOff;
+PROCEDURE CursorOn*;    BEGIN CSI('?'); Num(25); Char('h') END CursorOn;
+
+PROCEDURE Get*(): CHAR;
+BEGIN RETURN CHR(SYSTEM.SYS(CONIN,0))
+END Get;
+
+PROCEDURE HasKey*(): BOOLEAN;
+BEGIN RETURN SYSTEM.SYS(CONSTAT,0) # 0
+END HasKey;
+
+PROCEDURE ClearToEOL*;  BEGIN CSI('K') END ClearToEOL;
+PROCEDURE InsertLine*;  BEGIN CSI('L') END InsertLine;
+PROCEDURE DeleteLine*;  BEGIN CSI('M') END DeleteLine;
+
+PROCEDURE QueryCursorPosition*(VAR col,row: INTEGER);
+VAR char : CHAR;
+  PROCEDURE GetNum(): INTEGER; (* Read positive integer *)
+  VAR n   : INTEGER;
+      char: CHAR;
+  BEGIN
+    n := 0;
+    char := Get();
+    WHILE (char >= '0') AND (char <= '9') DO
+      n := n * 10 + ORD(char) - ORD('0');
+      char := Get();
+    END;
+    RETURN n
+  END GetNum;
+BEGIN
+  (* flush input *)
+  WHILE HasKey() DO char := Get() END;
+  (* Query Cursor Position *)
+  CSI('6'); Char('n');
+  (* Reads a Cursor Position Report (CPR) and returns the current row *)
+  char := Get();    (* should be ESC *)
+  char := Get();    (* should be [   *)
+  row  := GetNum(); (* also reads ',' *)
+  col  := GetNum(); (* also reads final R *)
+END QueryCursorPosition;
+
+PROCEDURE SenseSize*;
+VAR col, row: INTEGER;
+BEGIN
+  ClearScreen;
+  numCols := 0;
+  REPEAT Char('-'); INC(numCols); QueryCursorPosition(col,row) UNTIL row # 1;
+  Char(CHR(CR));
+  FOR row:=1 TO 120 DO Char(CHR(LF)) END; (* assumes it's enough to have the screen scroll *)
+  QueryCursorPosition(col, numRows);
+  ClearScreen;
+END SenseSize;
+
+PROCEDURE ReadLine*(VAR s: ARRAY OF CHAR);
+VAR ch  : CHAR;
+    length : INTEGER;
+BEGIN
+  length := 0;
+  REPEAT
+    ch := Get();
+    IF ch = CHR(TAB) THEN ch := ' ' END;
+    IF (ch = CHR(BACKSP)) OR (ch = CHR(DEL)) THEN
+      IF length # 0 THEN
+        Char(CHR(BACKSP)); Char(' '); Char(CHR(BACKSP));
+        DEC(length)
+      END;
+    ELSIF ch = CHR(CANCEL) THEN
+      WHILE length # 0 DO
+        Char(CHR(BACKSP)); Char(' '); Char(CHR(BACKSP));
+        DEC(length)
+      END;
+    ELSIF (ch < CHR(DEL)) AND (ch # CHR(CR)) THEN
+      s[length] := ch;
+      IF ch < ' ' THEN Char('^'); Char(CHR(ORD(ch)+64))
+      ELSE Char(ch)
+      END;
+      INC(length)
+    END;
+  UNTIL (ch = CHR(CR)) OR (length >= LEN(s));
+  IF length < LEN(s) THEN s[length] := CHR(NUL) END;
+  Ln
+END ReadLine;
+
+BEGIN
+  SenseSize
+END Terminal.
+

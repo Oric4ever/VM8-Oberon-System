@@ -1,0 +1,151 @@
+MODULE Scan;
+  IMPORT Streams;
+  (* $[+ remove procedure names *)
+  (* $O- remove overflow tests *)
+  (* $T- remove tests *)
+  (* $X+ *)
+
+  CONST LF = 0AH;
+  
+  VAR Done*: BOOLEAN;
+
+  PROCEDURE Char*(in: Streams.InputStream): CHAR;
+  VAR byte: BYTE;
+  BEGIN
+    Streams.Read(in, byte);
+    RETURN CHR(byte)
+  END Char;
+
+  PROCEDURE WhiteSpace*(in: Streams.InputStream);
+  BEGIN
+    REPEAT UNTIL Char(in) > ' ';
+    Streams.ReadAgain(in)
+  END WhiteSpace;
+
+  PROCEDURE String*(in: Streams.InputStream; VAR str: ARRAY OF CHAR; delimiter: CHAR);
+  VAR ch : CHAR;
+      len: INTEGER;
+  BEGIN
+    IF delimiter = ' ' THEN WhiteSpace(in) END;
+    len := 0; ch := Char(in);
+    WHILE (NOT Streams.End(in)) & (ch # CHR(LF)) & (ch # delimiter)  DO
+      IF len < LEN(str) THEN str[len] := ch; INC(len) END;
+      ch := Char(in)
+    END ;
+    Done := ch = delimiter;
+    IF Done THEN Streams.ReadAgain(in) END;
+    IF len < LEN(str) THEN str[len] := 0X END
+  END String;
+
+  PROCEDURE Line*(in: Streams.InputStream; VAR str: ARRAY OF CHAR);
+  VAR ch: CHAR;
+  BEGIN
+    String(in, str, CHR(LF)); ch := Char(in)
+  END Line;
+
+  PROCEDURE Ten(e: INTEGER): REAL;
+    VAR x, t: REAL;
+  BEGIN x := 1.0; t := 10.0;
+    WHILE e > 0 DO
+      IF ODD(e) THEN x := t * x END ;
+      t := t * t;
+      e := e DIV 2
+    END ;
+    RETURN x
+  END Ten;
+
+  PROCEDURE Int*(in: Streams.InputStream; VAR i: INTEGER);
+  VAR n: INTEGER;
+     ch: CHAR;
+     negative: BOOLEAN;
+  BEGIN
+    WhiteSpace(in);
+    i := 0; n := 0; ch := Char(in);
+    negative := (ch = '-');
+    IF negative OR (ch = '+') THEN ch := Char(in) END;
+    IF (ch < '0') OR (ch > '9') THEN Done := FALSE; RETURN END;
+    REPEAT
+      IF n >= 3276 THEN
+        Done := (n = 3276) AND (ch # '9') AND ( (ch # '8') OR negative);
+        IF Done THEN
+          n    := n * 10 + (ORD(ch) - ORD('0'));
+          IF negative THEN n := -n END;
+          ch   := Char(in);
+          Done := (ch < '0') OR (ch > '9');
+          Streams.ReadAgain(in);
+        END;
+        i := n;
+        RETURN
+      END;
+      n := n * 10 + (ORD(ch) - ORD('0'));
+      ch := Char(in);
+    UNTIL (ch < '0') OR (ch > '9');
+    Streams.ReadAgain(in);
+    IF negative THEN n := -n END;
+    Done := TRUE;
+    i := n
+  END Int;
+
+  PROCEDURE Long*(in: Streams.InputStream; VAR l: LONGINT);
+  VAR n: LONGINT;
+     ch: CHAR;
+     negative: BOOLEAN;
+  BEGIN
+    WhiteSpace(in);
+    n := LONG(0); l := n; ch := Char(in);
+    negative := (ch = '-');
+    IF negative OR (ch = '+') THEN ch := Char(in) END;
+    IF (ch < '0') OR (ch > '9') THEN Done := FALSE; RETURN END;
+    REPEAT
+      IF n >= LONG(0CCCH, 0CCCCH) THEN
+        Done := (n = LONG(0CCCH, 0CCCCH)) AND (ch # '9') AND ( (ch # '8') OR negative);
+        IF Done THEN
+          n     := n * LONG(10) + LONG(ORD(ch) - ORD('0'));
+          IF negative THEN n := -n END;
+          ch    := Char(in);
+          Done := (ch < '0') OR (ch > '9');
+          Streams.ReadAgain(in);
+        END;
+        l := n;
+        RETURN
+      END;
+      n  := n * LONG(10) + LONG(ORD(ch) - ORD('0'));
+      ch := Char(in);
+    UNTIL (ch < '0') OR (ch > '9');
+    Streams.ReadAgain(in);
+    IF negative THEN n := -n END;
+    Done := TRUE;
+    l := n
+  END Long;
+
+  PROCEDURE Real*(in: Streams.InputStream; VAR r: REAL);
+  VAR x: REAL;
+     ch: CHAR;
+     decimals, exponent: INTEGER;
+     negative, dotFound: BOOLEAN;
+  BEGIN
+    WhiteSpace(in);
+    x  := 0.0; r := x; exponent := 0; dotFound := FALSE; Done := FALSE;
+    ch := Char(in);
+    negative := (ch = '-');
+    IF negative OR (ch = '+') THEN ch := Char(in) END;
+    IF (ch < '0') OR (ch > '9') THEN RETURN END;
+    REPEAT
+      IF dotFound THEN INC(decimals) END;
+      x  := x * 10.0 + FLT(ORD(ch) - ORD('0'));
+      ch := Char(in);
+      IF ch = '.' THEN
+        IF dotFound THEN Streams.ReadAgain(in); RETURN END;
+        dotFound := TRUE;
+        ch := Char(in);
+      END
+    UNTIL (ch < '0') OR (ch > '9');
+    IF negative THEN x := -x END;
+    Done := TRUE;
+    IF CAP(ch) = 'E' THEN Int(in, exponent) END;
+    r := x * Ten(exponent - decimals);
+    Streams.ReadAgain(in);
+  END Real;
+
+END Scan.
+

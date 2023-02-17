@@ -1,0 +1,481 @@
+MODULE Files;
+ IMPORT SYSTEM, Disk, FAT32, DIR32, Terminal;
+
+ (* $X+ *)
+ (* $O- don't check for integer overflows *)
+
+ CONST FILEMARKER = 7A39H;
+
+ TYPE  ADDRESS        = INTEGER;
+       FileDescriptor = RECORD
+                          marker      : INTEGER;       (* to check that descriptor is initialized *)
+                          fileSize    : LONGINT;
+                          currCluster : FAT32.Cluster; (* cluster  of current buffer *)
+                          currFragment: INTEGER;       (* fragment of current buffer *)
+                          currSector  : LONGINT;       (*   LBA    of current buffer *)
+                          entry       : DIR32.Entry;   (* copy of directory entry *)
+                          bufferDirty : BOOLEAN;
+                          modified    : BOOLEAN;       (* flag for modified file *)
+                          buffer      : Disk.Sector;
+                        END;
+       File*          = POINTER TO FileDescriptor;
+       Rider*         = RECORD
+                          res*        : INTEGER;
+                          file        : File;
+                          pos         : LONGINT;
+                          bufferIndex : INTEGER;
+                          currSector  : LONGINT;
+                          eof*        : BOOLEAN;
+                        END;
+
+ VAR byteBuf: ARRAY 1 OF BYTE;
+
+(* oops, keep these debugging procedure or the procedures numbers will change ! *)
+ PROCEDURE WriteHex(x: BYTE);
+  PROCEDURE Digit(x: BYTE);
+  BEGIN
+    IF x > 9 THEN INC(x, 7) END;
+    Terminal.Char(CHR(48+ORD(x)))
+  END Digit;
+ BEGIN
+  Digit(x DIV 16);
+  Digit(x MOD 16);
+ END WriteHex;
+
+ (* $T- don't check indices *)
+
+ PROCEDURE CheckFile(f: File);
+ BEGIN
+   ASSERT( (f # NIL) AND (f.marker = FILEMARKER) )
+ END CheckFile;
+
+ PROCEDURE NextFileSector(f: File; extend: BOOLEAN);
+ VAR dummy: BOOLEAN;
+ BEGIN
+   dummy := FAT32.NextSector(f.currCluster, f.currFragment, extend);
+ END NextFileSector;
+
+ PROCEDURE Flush(f: File);
+ VAR size: LONGINT;
+ BEGIN
+   IF f.bufferDirty THEN
+     FAT32.WriteFragment(f.currCluster, f.currFragment, f.buffer);
+     f.bufferDirty := FALSE;
+     f.modified    := TRUE;
+   END;
+ END Flush;
+
+ PROCEDURE CheckSector(r: Rider);
+ VAR f: File;
+     nbSectors : LONGINT;
+ BEGIN
+   f := r.file;
+   IF r.currSector # f.currSector THEN
+     Flush(f);
+     IF r.currSector > f.currSector
+     THEN nbSectors := r.currSector - f.currSector (* follow chain from current cluster *)
+     ELSE
+       f.currSector  := LONG(0);
+       f.currCluster := f.entry.startCluster;      (* follow chain from start *)
+       nbSectors     := r.currSector
+     END;
+     FAT32.SkipSectors(f.currCluster, f.currSector, nbSectors);
+     f.currFragment  := FAT32.Fragment(f.currSector);
+     IF r.bufferIndex # 512 THEN FAT32.ReadFragment(f.currCluster, f.currFragment, f.buffer) END
+   END
+ END CheckSector;
+
+ (* Read bytes (up to nbytes) in a file.
+    Corner cases to test:
+    pos =    y, bufpos =   y,    fileSize = z,   nbytes = 0      =>   0 byte  read      OK
+    pos =    0, bufpos =   0,    fileSize = 0,   nbytes = x      =>   0 byte  read      OK
+    pos =    0, bufpos =   0,    fileSize = y,   nbytes = x<y    =>   x bytes read      OK
+    pos =    y, bufpos =   y,    fileSize = y,   nbytes = x      =>   0 byte  read      OK
+    pos =  512, bufpos =   0,    fileSize > 512, nbytes = 1      =>   1 byte  read      OK
+    pos =  512, bufpos = 512,    fileSize > 512, nbytes = 1      =>   1 byte  read      OK
+    pos =    1, bufpos =   1,    fileSize = 512, nbytes = 511    => 511 bytes read      OK, index = 512
+ *)
+
+ PROCEDURE ReadBytes*(VAR r: Rider; VAR dest: ARRAY OF BYTE; nbytes: INTEGER);
+ VAR f             : File;
+     bytesInBuffer : INTEGER;
+     remainingBytes: LONGINT;
+     bytesToTransfer: INTEGER;
+     destIndex     : INTEGER;
+ BEGIN
+   ASSERT(nbytes >= 0);
+   f := r.file;
+   CheckFile(f);
+   r.res          := 0;
+   destIndex      := 0;
+   remainingBytes := f.fileSize - r.pos;
+
+   (* limit nbytes to what the file contains *)
+   IF remainingBytes < LONG(nbytes) THEN
+     r.res  := nbytes - INT(remainingBytes);
+     nbytes := INT(remainingBytes);
+   END;
+   (* so now we won't exceed the file's end *)
+
+   CheckSector(r); (* checks that Rider's position is in File's buffer *)
+   bytesInBuffer  := 512 - r.bufferIndex;
+   IF nbytes <= bytesInBuffer THEN (* enough bytes in buffer *)
+     SYSTEM.COPY(SYSTEM.ADR(f.buffer)+r.bufferIndex, SYSTEM.ADR(dest), nbytes);
+     r.bufferIndex := r.bufferIndex + nbytes;
+     r.pos := r.pos + LONG(nbytes);
+     RETURN
+   END;
+   (* not enough bytes in buffer, transfer these buffer bytes *)
+   IF bytesInBuffer # 0 THEN
+     SYSTEM.COPY(SYSTEM.ADR(f.buffer)+r.bufferIndex, SYSTEM.ADR(dest), bytesInBuffer);
+     destIndex     := bytesInBuffer;
+     r.bufferIndex := 512;
+     r.pos         := r.pos + LONG(bytesInBuffer);
+     nbytes        := nbytes - bytesInBuffer
+   END;
+   (* now there are 0 bytes remaining in the buffer, we need to refill it *)
+   Flush(f); (* in case some bytes have been written in the first buffer *)
+   WHILE nbytes > 0 DO
+     IF nbytes >= 512 THEN bytesToTransfer := 512 ELSE bytesToTransfer := nbytes END;
+     r.currSector  := r.currSector + LONG(1);
+     f.currSector  := f.currSector + LONG(1);
+     NextFileSector(f, FALSE); (* no worry, we know we won't exceed file's end *)
+     FAT32.ReadFragment(f.currCluster, f.currFragment, f.buffer);
+     SYSTEM.COPY(SYSTEM.ADR(f.buffer), SYSTEM.ADR(dest)+destIndex, bytesToTransfer);
+     destIndex     := destIndex     + bytesToTransfer;
+     r.bufferIndex :=                 bytesToTransfer;
+     r.pos         := r.pos         + LONG(bytesToTransfer);
+     nbytes        := nbytes        - bytesToTransfer;
+   END;
+ END ReadBytes;
+
+ PROCEDURE Read*(VAR r: Rider; VAR x: BYTE);
+ VAR f: File;
+     byte: BYTE;
+ BEGIN
+   f := r.file;
+   IF (f # NIL)
+    & (f.marker = FILEMARKER)
+    & (r.currSector = f.currSector)
+    & (r.bufferIndex < 512)
+   THEN
+     x := f.buffer.data[r.bufferIndex];
+     INC(r.bufferIndex);
+     r.pos := r.pos + LONG(1);
+   ELSE (* otherwise use ReadBytes to refill the buffer *)
+     ReadBytes(r, byteBuf, 1);
+     x := byteBuf[0];
+   END;
+   r.eof := r.pos > f.fileSize;
+ END Read;
+
+ PROCEDURE ReadInt*(VAR r: Rider; VAR x : INTEGER);
+ VAR f: File;
+     byte1, byte2: BYTE;
+ BEGIN
+   f := r.file;
+   CheckFile(f);
+   CheckSector(r);
+   IF r.bufferIndex < 511
+   THEN
+     byte1 := f.buffer.data[r.bufferIndex];
+     byte2 := f.buffer.data[r.bufferIndex+1];
+     INC(r.bufferIndex, 2);
+     r.pos := r.pos + LONG(2);
+     r.eof := r.pos > f.fileSize;
+   ELSE
+     Read(r, byte1);
+     Read(r, byte2)
+   END;
+   x := ORD(byte1) + ORD(byte2) * 256
+ END ReadInt;
+
+
+ PROCEDURE WriteBytes*(VAR r: Rider; src: ARRAY OF BYTE; nbytes: INTEGER);
+ VAR roomInBuffer, bytesToWrite, srcIndex : INTEGER;
+     f : File;
+ BEGIN
+   ASSERT( nbytes >= 0 );
+   f := r.file;
+   CheckFile(f);
+   r.res    := 0; (* assume we will always succeed to write all bytes *)
+   srcIndex := 0;
+   CheckSector(r);
+   roomInBuffer := 512 - r.bufferIndex;
+   IF roomInBuffer > 0 THEN
+     f.bufferDirty := TRUE;
+     IF nbytes <= roomInBuffer THEN (* enough room in buffer *)
+       SYSTEM.COPY(SYSTEM.ADR(src), SYSTEM.ADR(f.buffer)+r.bufferIndex, nbytes);
+       r.bufferIndex := r.bufferIndex + nbytes;
+       r.pos := r.pos + LONG(nbytes);
+       IF r.pos > f.fileSize THEN f.fileSize := r.pos END;
+       RETURN
+     END;
+     (* otherwise, start by filling the current buffer *)
+     SYSTEM.COPY(SYSTEM.ADR(src), SYSTEM.ADR(f.buffer)+r.bufferIndex, roomInBuffer);
+     nbytes   := nbytes - roomInBuffer;
+     srcIndex :=          roomInBuffer;
+     r.pos    := r.pos  + LONG(roomInBuffer);
+   END;
+   (* buffer is now full *)
+   Flush(f);
+   r.bufferIndex := 512;
+   WHILE nbytes >= 512 DO  (* do full sectors transfers now, no need to read buffer *)
+     r.currSector := r.currSector + LONG(1);
+     f.currSector := f.currSector + LONG(1);
+     NextFileSector(f, TRUE);
+     SYSTEM.COPY(SYSTEM.ADR(src)+srcIndex, SYSTEM.ADR(f.buffer), 512);
+     DEC(nbytes, 512); INC(srcIndex, 512);
+     r.pos := r.pos + LONG(512);
+     f.bufferDirty := TRUE;
+     Flush(f);
+   END;
+   IF nbytes > 0 THEN
+     r.currSector := r.currSector + LONG(1);
+     f.currSector := f.currSector + LONG(1);
+     NextFileSector(f, TRUE);
+     (* the buffer needs to be read before being partially modified *)
+     (* TODO: avoid to read the buffer if the write will go further than file's end *)
+     FAT32.ReadFragment(f.currCluster, f.currFragment, f.buffer);
+     SYSTEM.COPY(SYSTEM.ADR(src)+srcIndex, SYSTEM.ADR(f.buffer), nbytes);
+     f.bufferDirty := TRUE;
+     r.bufferIndex := nbytes;
+     r.pos         := r.pos + LONG(nbytes);
+   END;
+   IF r.pos > f.fileSize THEN f.fileSize := r.pos END
+ END WriteBytes;
+
+ PROCEDURE Write*(VAR r: Rider; x: BYTE);
+ VAR f: File;
+ BEGIN
+   f := r.file;
+   IF (f # NIL)
+    & (f.marker = FILEMARKER)
+    & (r.currSector = f.currSector)
+    & (r.bufferIndex < 512)
+   THEN
+     f.bufferDirty := TRUE;
+     f.buffer.data[r.bufferIndex] := x;
+     INC(r.bufferIndex);
+     r.pos := r.pos + LONG(1);
+     IF r.pos > f.fileSize THEN f.fileSize := r.pos END
+   ELSE
+     byteBuf[0] := x;
+     WriteBytes(r, byteBuf, 1)
+   END;
+ END Write;
+
+ PROCEDURE WriteInt*(VAR r: Rider;  x: INTEGER);
+ VAR f: File;
+ BEGIN
+   f := r.file;
+   CheckFile(f);
+   CheckSector(r);
+   IF r.bufferIndex < 511 THEN
+     f.bufferDirty := TRUE;
+     f.buffer.data[r.bufferIndex  ] := x MOD 256;
+     f.buffer.data[r.bufferIndex+1] := x DIV 256;
+     INC(r.bufferIndex, 2);
+     r.pos := r.pos + LONG(2);
+     IF r.pos > f.fileSize THEN f.fileSize := r.pos END
+   ELSE
+     Write(r, x MOD 256);
+     Write(r, x DIV 256)
+   END
+ END WriteInt;
+
+ PROCEDURE Set*(VAR r: Rider; f: File; pos: LONGINT);
+ BEGIN
+   CheckFile(f);
+   IF    pos < LONG(0)    THEN pos := LONG(0);
+   ELSIF pos > f.fileSize THEN pos := f.fileSize
+   END;
+   r.file        := f;
+   r.eof         := FALSE;
+   r.res         := 0;
+   r.pos         := pos;
+   r.bufferIndex := LSW(pos) MOD 512;
+   r.currSector  := ASR(pos, 9); (* pos DIV LONG(512) *)
+
+   (* position rider on end of previous sector in case the position doesn't exist yet *)
+   IF (r.bufferIndex = 0) AND (pos # LONG(0)) AND (pos = f.fileSize) THEN
+     r.bufferIndex := 512; (* don't read the buffer because we don't know if next sector exists yet *)
+     r.currSector  := r.currSector - LONG(1); (* so stay at the end of previous sector *)
+   END;
+   CheckSector(r)
+ END Set;
+
+ PROCEDURE Init(f: File);
+ BEGIN
+   f.marker      := FILEMARKER;
+   f.fileSize    := f.entry.desc.fileSize;
+   f.currCluster := f.entry.startCluster;
+ END Init;
+
+ PROCEDURE Old*(name: ARRAY OF CHAR): File;
+ VAR f: File;
+ BEGIN
+   NEW(f);
+   IF DIR32.FileFind(name, f.entry)
+   THEN Init(f); FAT32.ReadFragment(f.currCluster, f.currFragment, f.buffer)
+   ELSE DISPOSE(f)
+   END;
+   RETURN f
+ END Old;
+
+ PROCEDURE New*(name: ARRAY OF CHAR): File;
+ VAR f: File;
+ BEGIN
+   NEW(f);
+   DIR32.Build83Name(name, f.entry.desc.nameAndType);
+   f.entry.startCluster := FAT32.FindFreeCluster();
+   f.entry.directory    := DIR32.CurrentDir();
+   Init(f);
+   RETURN f
+ END New;
+
+ PROCEDURE Register*(f: File);
+ VAR startCluster: FAT32.Cluster;
+     fileSize    : LONGINT;
+     replaceOld  : BOOLEAN;
+     currentDir  : DIR32.Directory;
+ BEGIN
+   CheckFile(f);
+   Flush(f);
+   startCluster := f.entry.startCluster; (* save StartCluster *)
+   currentDir   := DIR32.CurrentDir();
+   DIR32.SetCurrentDir(f.entry.directory);
+   DIR32.InitFind(f.entry.desc.nameAndType);
+   replaceOld := DIR32.FindNextMatch(f.entry);  (* this overwrites f.entry.startCluster *)
+   IF replaceOld THEN FAT32.DeleteChain(DIR32.StartCluster(f.entry)) END;
+   f.entry.startCluster := startCluster; (* restore StartCluster *)
+   DIR32.SetStartCluster(f.entry, startCluster);
+   f.entry.desc.fileSize := f.fileSize;
+   IF replaceOld
+   THEN DIR32.UpdateEntry(f.entry)
+   ELSE DIR32.   NewEntry(f.entry)
+   END;
+   DIR32.SetCurrentDir(currentDir);
+ END Register;
+
+ PROCEDURE Close*(f: File);
+ BEGIN
+   CheckFile(f);
+   Flush(f);
+   f.entry.desc.fileSize := f.fileSize;
+   IF f.modified THEN DIR32.UpdateEntry(f.entry) END;
+   DISPOSE(f);
+ END Close;
+
+ PROCEDURE Purge*(f: File);
+ BEGIN
+   CheckFile(f);
+   FAT32.DeleteChain(f.entry.startCluster);
+   f.entry.startCluster := FAT32.FindFreeCluster();
+   f.fileSize := LONG(0);
+   f.modified := TRUE;
+ END Purge;
+
+ PROCEDURE Delete*(name: ARRAY OF CHAR; VAR res: INTEGER);
+ VAR entry: DIR32.Entry;
+ BEGIN
+   res := ORD( NOT DIR32.FileFind(name, entry) );
+   IF res = 0 THEN DIR32.DeleteEntry(entry) END
+ END Delete;
+
+ PROCEDURE Rename*(old, new: ARRAY OF CHAR; VAR res: INTEGER);
+ VAR entry : DIR32.Entry;
+ BEGIN
+   res := ORD( NOT DIR32.FileFind(old, entry) );
+   IF res = 0 THEN
+     DIR32.Build83Name(new, entry.desc.nameAndType);
+     DIR32.UpdateEntry(entry);
+   END
+ END Rename;
+
+ PROCEDURE Length*(f: File): LONGINT;
+ BEGIN CheckFile(f); RETURN f.fileSize
+ END Length;
+
+ PROCEDURE GetDate*(f: File; VAR t, d: INTEGER);
+ BEGIN
+   t := f.entry.desc.writeTime;
+   d := f.entry.desc.writeDate;
+ END GetDate;
+
+ PROCEDURE ReadLInt*(VAR r: Rider; VAR x : LONGINT);
+ VAR lsw, msw: INTEGER;
+ BEGIN
+   ReadInt(r, lsw);
+   ReadInt(r, msw);
+   x := LONG(msw, lsw)
+ END ReadLInt;
+
+ PROCEDURE ReadReal*(VAR r: Rider; VAR x : REAL);
+ VAR long: LONGINT;
+ BEGIN
+   ReadLInt(r, long);
+   x := SYSTEM.VAL(REAL, long)
+ END ReadReal;
+
+ PROCEDURE ReadSet*(VAR r: Rider; VAR x : SET);
+ VAR i: INTEGER;
+ BEGIN
+   ReadInt(r, i);
+   x := SYSTEM.VAL(SET, i)
+ END ReadSet;
+
+ PROCEDURE ReadString*(VAR r: Rider; VAR s: ARRAY OF CHAR);
+ VAR i: INTEGER;
+     byte: BYTE;
+ BEGIN
+   i := 0;
+   REPEAT
+     Read(r, byte);
+     IF i < LEN(s) THEN s[i] := CHR(ORD(byte)); INC(i) END
+   UNTIL byte = 0;
+ END ReadString;
+
+ PROCEDURE ReadBool*(VAR r: Rider; VAR x : BOOLEAN);
+ VAR byte: BYTE;
+ BEGIN
+   Read(r, byte); x := SYSTEM.VAL(BOOLEAN, byte)
+ END ReadBool;
+
+ PROCEDURE WriteLInt*(VAR r: Rider; x: LONGINT);
+ BEGIN
+   WriteInt(r, LSW(x));
+   WriteInt(r, MSW(x));
+ END WriteLInt;
+
+ PROCEDURE WriteReal*(VAR r: Rider; x: REAL);
+ BEGIN WriteLInt(r, SYSTEM.VAL(LONGINT, x))
+ END WriteReal;
+
+ PROCEDURE WriteSet*(VAR r: Rider; x: SET);
+ BEGIN WriteInt(r, SYSTEM.VAL(INTEGER, x))
+ END WriteSet;
+
+ PROCEDURE WriteBool*(VAR r: Rider; x: BOOLEAN);
+ BEGIN Write(r, SYSTEM.VAL(BYTE, x))
+ END WriteBool;
+
+ PROCEDURE WriteString*(VAR r: Rider; x: ARRAY OF CHAR);
+ VAR i: INTEGER; b: BYTE;
+ BEGIN
+   i := 0;
+   REPEAT
+     b := ORD(x[i]); Write(r, b); INC(i)
+   UNTIL (i >= LEN(x)) OR (b = 0)
+ END WriteString;
+
+ PROCEDURE Pos*(r: Rider): LONGINT;
+ BEGIN RETURN r.pos
+ END Pos;
+
+ PROCEDURE Base*(r: Rider): File;
+ BEGIN RETURN r.file
+ END Base;
+
+END Files.
+

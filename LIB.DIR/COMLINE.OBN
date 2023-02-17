@@ -1,0 +1,26 @@
+MODULE ComLine;
+IMPORT Loader;
+
+TYPE FileName* = ARRAY 12 OF CHAR;
+VAR
+    programName*, arg1*, arg2*, inName*, outName*: FileName;
+    chainedExec : BOOLEAN;
+    success     : BOOLEAN;
+
+PROCEDURE Chain*(prog,firstArg,secondArg,inRedirect,outRedirect: ARRAY OF CHAR);
+BEGIN
+  programName := prog;
+         arg1 :=  firstArg;
+         arg2 := secondArg;
+       inName := inRedirect;
+      outName := outRedirect;
+  chainedExec := TRUE;
+END Chain;
+
+BEGIN
+  REPEAT
+    IF NOT chainedExec THEN ASSERT( Loader.Call("SHELL") ) END;
+    chainedExec := FALSE;
+    success     := Loader.Call(programName);
+  UNTIL FALSE
+END ComLine.

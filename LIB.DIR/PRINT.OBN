@@ -1,0 +1,72 @@
+MODULE Print;
+IMPORT Terminal, Streams, Format;
+
+CONST SPACE=20H; LF=0AH;
+
+TYPE Printer* = Streams.OutputStream;
+
+PROCEDURE RightJustified*(p: Printer; str: ARRAY OF CHAR; n: INTEGER);
+BEGIN
+  ASSERT(n > 0);
+  WHILE n > LEN(str) DO Streams.Write(p, SPACE); DEC(n) END;
+  n := LEN(str) - n;
+  WHILE (n # 0) AND (str[n-1] # ' ') DO DEC(n) END;
+  WHILE n < LEN(str) DO Streams.Write(p, ORD(str[n])); INC(n) END;
+END RightJustified;
+
+PROCEDURE Char*(p: Printer; ch: CHAR);
+BEGIN Streams.Write(p, ORD(ch))
+END Char;
+
+PROCEDURE String*(p: Printer; s: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+  i := 0;
+  WHILE (i < LEN(s)) AND (s[i] # 0X) DO
+    Streams.Write(p, ORD(s[i]));
+    INC(i)
+  END;
+END String;
+
+PROCEDURE Int*(p: Printer; i, width: INTEGER);
+VAR buf: ARRAY 6 OF CHAR;
+BEGIN
+  Format.Int(i, buf);
+  RightJustified(p,buf,width);
+END Int;
+
+PROCEDURE Long*(p: Printer; l: LONGINT; width: INTEGER);
+VAR buf: ARRAY 11 OF CHAR;
+BEGIN
+  Format.Long(l, buf);
+  RightJustified(p,buf,width);
+END Long;
+
+PROCEDURE Hex*(p: Printer; i: INTEGER);
+  PROCEDURE HexByte(p: Printer; i: INTEGER);
+    PROCEDURE HexDigit(p: Printer; i: INTEGER);
+    BEGIN
+      IF i > 9 THEN INC(i, 7) END;
+      Streams.Write(p, i + ORD('0'))
+    END HexDigit;
+  BEGIN
+    HexDigit(p, i DIV 16);
+    HexDigit(p, i MOD 16);
+  END HexByte;
+BEGIN
+  HexByte(p, i DIV 256 MOD 256);
+  HexByte(p, i MOD 256 );
+END Hex;
+
+PROCEDURE Real*(p: Printer; x: REAL; width: INTEGER);
+VAR buf: ARRAY 13 OF CHAR;
+BEGIN
+  Format.Real(x,buf);
+  RightJustified(p,buf,width);
+END Real;
+
+PROCEDURE Ln*(p: Printer);
+BEGIN Streams.Write(p, LF)
+END Ln;
+
+END Print.

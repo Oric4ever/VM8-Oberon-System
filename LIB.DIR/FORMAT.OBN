@@ -1,0 +1,211 @@
+MODULE Format;
+IMPORT SYSTEM, Terminal;
+
+CONST SPACE = 20H;
+(* $X+ *)
+
+(* write a right-justified decimal representation of i in string buffer s *)
+PROCEDURE Int*(i: INTEGER;  VAR s: ARRAY OF CHAR);
+VAR index, tmp: INTEGER;
+    negative: BOOLEAN;
+BEGIN
+  SYSTEM.FILL(SYSTEM.ADR(s), LEN(s), SPACE);
+  index    := LEN(s)-1;
+  negative := i < 0;
+  tmp      := ABS(i);
+  IF tmp < 0 THEN s[index] := "8"; DEC(index); tmp := 3276 END; (* handle -2^15 *)
+  REPEAT
+    s[index] := CHR(tmp MOD 10 + ORD('0'));
+    tmp := tmp DIV 10;
+    DEC(index);
+  UNTIL tmp = 0;
+  IF negative THEN s[index] := '-' END;
+END Int;
+
+(* write a right-justified decimal representation of l in string buffer s *)
+PROCEDURE Long*(l: LONGINT;  VAR s: ARRAY OF CHAR);
+VAR index: INTEGER;
+    tmp  : LONGINT;
+    negative: BOOLEAN;
+BEGIN
+  SYSTEM.FILL(SYSTEM.ADR(s), LEN(s), SPACE);
+  index    := LEN(s)-1;
+  negative := l < LONG(0);
+  tmp      := ABS(l);
+  IF tmp < LONG(0) THEN s[index] := '8'; DEC(index); tmp := LONG(0CCCH, 0CCCCH) END; (* handle -2^31 *)
+  REPEAT
+    s[index] := CHR(INT(tmp MOD LONG(10)) + ORD('0'));
+    tmp := tmp DIV LONG(10);
+    DEC(index);
+  UNTIL tmp = LONG(0);
+  IF negative THEN s[index] := '-' END;
+END Long;
+
+(* Computes 10^exp, where exp is positive *)
+PROCEDURE Ten(exp: INTEGER): REAL;
+VAR n: INTEGER;
+    result: REAL;
+BEGIN
+  n := 0;
+  result := 1.0;
+  REPEAT
+    IF ODD(exp) THEN
+      CASE n OF 
+      | 0 : result := result * 1.0E1
+      | 1 : result := result * 1.0E2
+      | 2 : result := result * 1.0E4
+      | 3 : result := result * 1.0E8
+      | 4 : result := result * 1.0E16
+      | 5 : result := result * 1.0E32
+      END;
+    END;
+    exp := exp DIV 2;
+    INC(n);
+  UNTIL exp = 0;
+  RETURN result
+END Ten;
+
+(* write a right-justified decimal representation of x in string buffer s :
+ *   format is -1.234567E+12 i.e 13 characters...
+ *  exception made for 0
+ *)
+PROCEDURE Real*(x: REAL; VAR s: ARRAY OF CHAR);
+CONST DECIMALS=5;
+VAR exp, index, i : INTEGER;
+    mantissa  : LONGINT;
+    digits    : ARRAY DECIMALS+1 OF CHAR;
+BEGIN
+  ASSERT( LEN(s) >= 13 );
+  index := LEN(s) - 13;
+  exp   := INT(ASR(SYSTEM.VAL(LONGINT, x), 23)) MOD 100H;  (*binary exponent*)
+  SYSTEM.FILL(SYSTEM.ADR(s), LEN(s), SPACE);
+  IF    exp =   0 THEN s[index+1] := "0"  (* align 0 on 1st digit *)
+  ELSIF exp = 255 THEN s := "NaN"; s[3] := CHR(SPACE)  (* NaN is left-aligned *)
+  ELSE
+    IF x < 0.0 THEN s[index] := "-"; x := -x END;
+    exp := (exp - 127) * 77 DIV 256;  (* Log2 to Log10 *)
+    (* get decimals after the point, plus the digit before the floating point *)
+    IF exp >= DECIMALS THEN x := x / Ten(exp-DECIMALS) ELSE x := Ten(DECIMALS-exp) * x END ;
+    mantissa := FLOOR(x + 0.5);
+    IF mantissa >= LONG(0FH, 4240H) (* 1000000 *) THEN (* rounding has overflowed to 7 digits *)
+      INC(exp);
+      mantissa := mantissa DIV LONG(10)
+    END ;
+    Long(mantissa, digits);
+    s[index+1]  := digits[0];
+    s[index+2]  := '.';
+    INC(index, 3);
+    i := 1; REPEAT s[index] := digits[i]; INC(index); INC(i) UNTIL i = LEN(digits);
+    s[index] := "E"; INC(index);
+    IF exp < 0
+    THEN s[index] := "-"; exp := -exp
+    ELSE s[index] := "+"
+    END ;
+    INC(index);
+    s[index  ] := CHR(exp DIV 10 + 30H);
+    s[index+1] := CHR(exp MOD 10 + 30H)
+  END
+END Real;
+
+(* From CONVERT
+
+PROCEDURE Real*(r: REAL; VAR s: ARRAY OF CHAR; digits: INTEGER);␍
+VAR scientificNotation : BOOLEAN;␍
+    local3 : CARDINAL;␍
+    width  : CARDINAL;␍
+    index : CARDINAL;␍
+    decimals : CARDINAL;␍
+    local7 : CARDINAL;␍
+    exponent : INTEGER;␍
+    negative: BOOLEAN;␍
+    local11: LONGINT;␍
+    local13: LONGINT;␍
+    tmp: REAL;
+BEGIN␍
+  SYSTEM.FILL(SYSTEM.ADR(s), LEN(s), 20H);␍
+  exponent := 0;␍
+  local11  := LONG(0);␍
+  width    := 0;␍
+  local3   := 1;␍
+  scientificNotation := (digits < 0);␍
+  decimals := ABS(digits);␍
+  negative := r < 0.0;␍
+  r        := ABS(r);␍
+
+  exponent := INT(ASR(SYSTEM.VAL(LONGINT, r), 23)) - 127;␍
+  IF exponent = -127 THEN (* representation of Zero *)␍
+    IF scientificNotation THEN s[LEN(s)-1] := '0'; RETURN END;␍
+    width := digits + 1;␍
+  ELSE␍
+    IF exponent >= 0 THEN␍
+      (* convert binary exponent to exponent in base 10 : log(2) ~ 77/256 *)␍
+      exponent := exponent * 77 DIV 256 + 1;␍
+      IF exponent = 39␍
+      THEN r := r / 1.0E37 / 100.0  (* can't do Ten(39) *)␍
+      ELSE r := r / Ten(exponent)␍
+      END;␍
+      IF r >= 1.0 THEN r := r / 10.0; INC(exponent) END;␍
+    ELSE␍
+      (* convert binary exponent to exponent in base 10 : log(2) ~ 77/256 *)␍
+      exponent := (exponent+1)*77 DIV 256;␍
+      r := r * Ten(-exponent);␍
+      IF r < 0.1 THEN r := r * 10.0; DEC(exponent) END;␍
+    END;␍
+    index := decimals + 1;
+    IF NOT scientificNotation THEN index := index + exponent - 1 END;
+    IF index >= 0 THEN␍
+      IF index > 7 THEN index := 7 END;␍
+      r := r + 0.5 / Ten(index);  (* add 0.5 to next decimal for rounding *)␍
+    END;␍
+    IF r >= 1.0 THEN r := r / 10.0; INC(exponent) END;␍
+    IF NOT scientificNotation THEN␍
+      IF exponent >= 1 THEN local3 := exponent␍
+      ELSE width := 1 - exponent␍
+      END;␍
+    END;␍
+
+    tmp := SYSTEM.VAL(REAL, SYSTEM.VAL(LONGINT,r) + LONG(0C00H, 0));␍
+    INC(value.msw, 0C00H);␍
+
+    local11 := FLOOR(tmp) * LONG(10);␍
+    IF local11 < 16777216L THEN local11 := 16777216L END;␍
+  END;␍
+  index    := decimals + local3;␍
+  decimals := 7;␍
+  local7   := LEN(s)-1;␍
+  IF scientificNotation THEN local7 := local7 - 4␍
+  ELSIF digits = 0      THEN DEC(index)␍
+  END;␍
+  ASSERT( index < local7 );␍
+  index := local7 - index;␍
+  IF negative THEN s[index-1] := '-' END;␍
+  REPEAT␍
+    IF width # 0 THEN s[index] := '0'; DEC(width)␍
+    ELSIF decimals # 0 THEN␍
+      local13 := local11 DIV 16777216L;␍
+      s[index] := CHR(CARD(local13) + ORD('0'));␍
+      local11 := (local11 - local13 * 16777216L) * LONG(10);␍
+      DEC(decimals);␍
+    ELSE␍
+      s[index] := '0'␍
+    END;␍
+    INC(index);␍
+    IF local3 # 0 THEN␍
+      DEC(local3);␍
+      IF (local3 = 0) AND (digits # 0) THEN␍
+        s[index] := '.';␍
+        INC(index)␍
+      END;␍
+    END;␍
+  UNTIL index > local7;␍
+  IF scientificNotation THEN␍
+    s[index]   := 'E';␍
+    s[index+1] := CHR( ORD('+') + ORD(exponent <= 0)*2 );␍
+    exponent   := ABS(exponent - 1);␍
+    s[index+2] := CHR(CARDINAL(exponent) DIV 10 + ORD('0'));␍
+    s[index+3] := CHR(CARDINAL(exponent) MOD 10 + ORD('0'));␍
+  END;␍
+END Real;␍
+*)
+
+END Format.

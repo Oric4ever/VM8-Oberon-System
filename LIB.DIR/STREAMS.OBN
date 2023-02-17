@@ -1,0 +1,132 @@
+MODULE Streams;
+IMPORT SYSTEM, Terminal, Files, ComLine;
+
+(* $X+ *)
+
+CONST CR = 0DH; LF = 0AH; CTRLC = 3; EOF = 1AH;
+    NONE = 0; INPUT = 1; OUTPUT = 2;
+
+TYPE
+   StreamDesc   = TAGGED RECORD
+                    rider  : Files.Rider;
+                    console: BOOLEAN;
+                  END;
+    InputDesc   = RECORD(StreamDesc)
+                    lastReadByte : BYTE;
+                    mustReadAgain: BOOLEAN;
+                  END;
+   OutputDesc   = RECORD(StreamDesc)
+                  END;
+
+         Stream*= POINTER TO StreamDesc;
+    InputStream*= POINTER TO  InputDesc;
+   OutputStream*= POINTER TO OutputDesc;
+
+VAR input*         :  InputStream;
+    output*        : OutputStream;
+    termBuffer     : ARRAY 128 OF CHAR;
+    bufferIndex    : INTEGER;
+
+(* Open stream for reading *)
+PROCEDURE Input*(name: ARRAY OF CHAR): InputStream;
+VAR file   : Files.File;
+    stream : InputStream;
+BEGIN
+  NEW(stream);
+  stream.console := name = "";
+  IF stream.console THEN bufferIndex := 0;
+  ELSE
+    file := Files.Old(name);
+    IF file = NIL
+    THEN DISPOSE(stream)
+    ELSE Files.Set(stream.rider, file, LONG(0))
+    END
+  END;
+  RETURN stream
+END Input;
+
+(* Create stream for writing *)
+PROCEDURE Output*(name: ARRAY OF CHAR): OutputStream;
+VAR stream : OutputStream;
+BEGIN
+  NEW(stream);
+  stream.console := name = "";
+  IF NOT stream.console THEN
+    Files.Set(stream.rider, Files.New(name), LONG(0))
+  END;
+  RETURN stream
+END Output;
+
+PROCEDURE Close*(s: Stream);
+VAR file : Files.File;
+BEGIN
+  IF s # NIL THEN
+    IF s.console THEN bufferIndex := 0
+    ELSE
+      file := Files.Base(s.rider);
+      IF s IS OutputStream THEN Files.Register(file) END;
+      Files.Close(file)
+    END;
+    CASE s OF  (* be sure to DEALLOCATE the correct size *)
+    |  InputStream: DISPOSE(s)
+    | OutputStream: DISPOSE(s)
+    END
+  END
+END Close;
+
+PROCEDURE End*(s: InputStream): BOOLEAN;
+BEGIN
+  RETURN (s = NIL)
+      OR (s.lastReadByte = EOF)
+      OR (NOT s.console) AND s.rider.eof
+END End;
+
+PROCEDURE File*(s: Stream): Files.File;
+BEGIN 
+  IF (s = NIL) OR s.console 
+  THEN RETURN NIL
+  ELSE RETURN Files.Base(s.rider) 
+  END
+END File;
+
+PROCEDURE Read*(s: InputStream; VAR ch: BYTE);
+BEGIN
+  ASSERT( s # NIL );
+  IF s.mustReadAgain THEN
+    ch := s.lastReadByte;
+    s.mustReadAgain := FALSE
+  ELSIF s.console THEN
+    IF (bufferIndex = 0) OR (termBuffer[bufferIndex-1] = 0X) THEN
+      Terminal.ReadLine(termBuffer);
+      termBuffer[127] := 0X;
+      bufferIndex := 0;
+    END;
+    ch := ORD(termBuffer[bufferIndex]);
+    INC(bufferIndex);
+    IF ch = 0 THEN ch := LF END
+  ELSE
+    Files.Read(s.rider, ch);
+  END;
+  s.lastReadByte := ch
+END Read;
+
+PROCEDURE ReadAgain*(s: InputStream);
+BEGIN
+  IF s # NIL THEN s.mustReadAgain := TRUE END
+END ReadAgain;
+
+PROCEDURE Write*(s: OutputStream; ch: BYTE);
+BEGIN
+  ASSERT( s # NIL );
+  IF s.console THEN
+    IF ch = LF THEN Terminal.Ln ELSE Terminal.Char(CHR(ch)) END
+  ELSE
+    Files.Write(s.rider, ch);
+  END;
+END Write;
+
+BEGIN
+   input :=  Input(ComLine. inName);
+  output := Output(ComLine.outName);
+END Streams.
+

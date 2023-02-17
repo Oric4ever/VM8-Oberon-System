@@ -1,0 +1,49 @@
+MODULE In;
+IMPORT Streams, Scan;
+
+VAR Done*: BOOLEAN;
+    in   : Streams.InputStream;
+
+PROCEDURE Open*;
+BEGIN END Open;
+
+PROCEDURE Char*(VAR ch: CHAR);
+BEGIN ch := Scan.Char(in)
+END Char;
+
+PROCEDURE Int*(VAR i: INTEGER);
+BEGIN Scan.Int(in, i); Done := Scan.Done
+END Int;
+
+PROCEDURE Long*(VAR l: LONGINT);
+BEGIN Scan.Long(in, l); Done := Scan.Done
+END Long;
+
+PROCEDURE Real*(VAR x: REAL);
+BEGIN Scan.Real(in, x); Done := Scan.Done
+END Real;
+
+PROCEDURE String*(VAR str: ARRAY OF CHAR);
+VAR delimiter: CHAR;
+BEGIN
+  Char(delimiter);
+  Done := delimiter = '"';
+  IF Done THEN Scan.String(in, str, delimiter); Done := Scan.Done END;
+  IF Done THEN Char(delimiter) END;
+END String;
+
+PROCEDURE Name*(VAR name: ARRAY OF CHAR);
+BEGIN Scan.String(in, name, ' '); Done := Scan.Done
+END Name;
+
+PROCEDURE Line*(VAR line: ARRAY OF CHAR);
+BEGIN Scan.Line(in, line); Done := Scan.Done
+END Line;
+
+PROCEDURE End*():BOOLEAN;
+BEGIN RETURN Streams.End(in)
+END End;
+
+BEGIN
+  in := Streams.input
+END In.
