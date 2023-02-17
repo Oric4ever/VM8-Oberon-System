@@ -1,5 +1,5 @@
 # VM8-Oberon-System
-System Disk for the VM-8 computer, and a Linux emulator
+An Oberon System for the VM-8 computer, and a Linux emulator
 
 This is the third version of a system for the VM-8 Computer : now it is written in Oberon-07 only, and the Turbo Modula-2 Reloaded compiler is not supported any more...
 
