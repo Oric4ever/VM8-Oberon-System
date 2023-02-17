@@ -1,11 +1,11 @@
 # VM8-Oberon-System
 System Disk for the VM-8 computer, and a Linux emulator
 
-This is the third version of a system for the VM-8 Computer : now it is written in Oberon-07 only, so the Turbo Modula-2 Reloaded compiler is not supported any more...
+This is the third version of a system for the VM-8 Computer : now it is written in Oberon-07 only, and the Turbo Modula-2 Reloaded compiler is not supported any more...
 
 Short rationale for the abandon of Turbo Modula-2 : 
 
-- firstly, the Turbo Modula-2 compiler required more than 64 KB actually (in order to run in the 64 KB address space, it used overlays, ie. the code of several modules shared the same location, they were loaded from disk each time a call or return required some module to be present in memory), 
+- firstly, the Turbo Modula-2 compiler actually required more than 64 KB (in order to run in the 64 KB address space, it used overlays, ie. the code of several modules shared the same location, these modules were loaded from disk each time a call or return required them to be present in memory), 
 - secondly, I have been experimenting working with a small stack (1 KB typically), it cannot work with the Turbo Modula-2 compiler (due to some recursions in the linked-lists of the symbol table), whilst it can work with the Oberon compiler,
 - and thirdly, I gave up providing a proper decompiled source of Turbo Modula-2 (because the use of variant records make the decompiling process such a hard puzzle to decipher).
 
@@ -14,6 +14,7 @@ The Oberon-07 compiler is derived from Project Oberon (http://www.projectoberon.
 The firmware for the VM-8 computer (ie. the Modified Turbo Modula-2 Virtual Machine) is provided on the `MCodeOnAVR` repository.
 Alternatively, the system can be run on Linux-type systems, with the provided (ugly) VM implementation for Linux.
 
+<!---
 TRY IT:
 
 1. Download the virtual machine for Linux and compile it (make). It should work without modification on Linux, Android (in Termux), Windows (with Cygwin).
@@ -37,6 +38,8 @@ TRY IT:
 - cd demo
 - rushhour <level.030  (this solves a rushhour puzzle, and animates the solution)
 - ...
+
+-->
 
 STATUS:
 The system is up and running, it is able to compile itself and can be modified.
